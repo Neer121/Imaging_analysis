@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--margin", type=int, default=250)
     parser.add_argument("--closing-iterations", type=int, default=160)
     parser.add_argument("--mask-channel", type=int, default=0)
+    parser.add_argument("--final-box-padding", type=int, default=1)
     parser.add_argument(
         "--sort-mode",
         choices=("row", "row_left_to_right", "row_right_to_left", "diagonal", "area"),
@@ -48,6 +49,7 @@ def main() -> None:
             opening_radius=0,
             closing_iterations=max(1, args.closing_iterations // args.downsample),
             sort_mode=args.sort_mode,
+            final_box_padding=args.final_box_padding,
         )
 
         overlay = Image.fromarray(rgb, mode="RGB")

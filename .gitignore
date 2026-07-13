@@ -7,3 +7,8 @@ __pycache__/
 
 # Large raw microscopy data should stay local or use external storage/Git LFS.
 *.nd2
+
+# Local generated workflow artifacts
+outputs/
+verification_pytest.txt
+verification_workflow_pytest.txt

@@ -33,6 +33,7 @@ class PipelineConfig:
     threshold_quantile: float = 0.90
     sort_mode: str = "row"
     row_tolerance: float | None = None
+    final_box_padding: int = 32
     scene_index: int = 0
     position_index: int | None = None
     time_index: int = 0
@@ -101,6 +102,7 @@ def process_nd2_file(
         threshold_quantile=cfg.threshold_quantile,
         sort_mode=cfg.sort_mode,  # type: ignore[arg-type]
         row_tolerance=cfg.row_tolerance,
+        final_box_padding=cfg.final_box_padding,
     )
 
     merged_path = file_output_dir / f"{input_path.stem}_merged.tif"

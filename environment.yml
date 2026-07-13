@@ -17,4 +17,6 @@ dependencies:
   - tifffile
   - xarray
   - pip:
+      - brainglobe-atlasapi
+      - brainreg
       - nd2>=0.10

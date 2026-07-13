@@ -85,6 +85,7 @@ def summarize_nd2(path: str | Path) -> dict[str, Any]:
             "path": str(nd2_path),
             "sizes": dict(getattr(handle, "sizes", {})),
             "channels": _channel_metadata(handle),
+            "voxel_size_um": _voxel_size_metadata(handle),
         }
         for attr in ("shape", "dtype", "is_rgb", "attributes"):
             try:
@@ -123,6 +124,7 @@ def read_nd2_image(
         metadata = {
             "sizes": sizes,
             "channels": _channel_metadata(handle),
+            "voxel_size_um": _voxel_size_metadata(handle),
             "source_dims": dims,
             "scene_index": scene_index,
             "position_index": position_index,
@@ -318,3 +320,27 @@ def _channel_metadata(handle: Any) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def _voxel_size_metadata(handle: Any) -> dict[str, float | None] | None:
+    voxel_size = getattr(handle, "voxel_size", None)
+    if voxel_size is None:
+        return None
+
+    try:
+        voxel = voxel_size() if callable(voxel_size) else voxel_size
+    except Exception:
+        return None
+
+    def _read_component(names: tuple[str, ...]) -> float | None:
+        for name in names:
+            if hasattr(voxel, name):
+                value = getattr(voxel, name)
+                return float(value) if value is not None else None
+        return None
+
+    return {
+        "x": _read_component(("x",)),
+        "y": _read_component(("y",)),
+        "z": _read_component(("z",)),
+    }

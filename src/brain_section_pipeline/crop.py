@@ -81,6 +81,11 @@ def detect_section_crops(
     threshold_quantile: float = 0.90,
     sort_mode: SortMode = "row",
     row_tolerance: float | None = None,
+    merge_box_fragments: bool = True,
+    merge_box_gap: int | None = None,
+    merge_overlap_fraction: float = 0.5,
+    merge_max_area_ratio: float = 0.5,
+    final_box_padding: int = 0,
 ) -> CropDetectionResult:
     """Detect separated tissue sections and return ordered crop boxes."""
 
@@ -98,6 +103,15 @@ def detect_section_crops(
     labels = measure.label(mask)
     boxes = _boxes_from_labels(labels, min_area=min_area, margin=margin)
     boxes = _drop_nested_boxes(boxes)
+    if merge_box_fragments:
+        boxes = _merge_close_boxes(
+            boxes,
+            gap=max(5, margin // 2) if merge_box_gap is None else merge_box_gap,
+            min_overlap_fraction=merge_overlap_fraction,
+            max_area_ratio=merge_max_area_ratio,
+        )
+    if final_box_padding > 0:
+        boxes = _expand_boxes(boxes, padding=final_box_padding, image_shape=mask.shape)
     boxes = sort_crop_boxes(boxes, image_shape=mask.shape, mode=sort_mode, row_tolerance=row_tolerance)
     return CropDetectionResult(boxes=boxes, mask=mask.astype(bool), labels=labels, threshold=float(threshold))
 
@@ -289,6 +303,124 @@ def _drop_nested_boxes(boxes: list[CropBox], *, containment_threshold: float = 0
     return keep
 
 
+def _merge_close_boxes(
+    boxes: list[CropBox],
+    *,
+    gap: int,
+    min_overlap_fraction: float,
+    max_area_ratio: float,
+) -> list[CropBox]:
+    if len(boxes) < 2:
+        return list(boxes)
+
+    merged = list(boxes)
+    changed = True
+    while changed:
+        changed = False
+        next_boxes: list[CropBox] = []
+        consumed = [False] * len(merged)
+        for index, box in enumerate(merged):
+            if consumed[index]:
+                continue
+            current = box
+            for other_index in range(index + 1, len(merged)):
+                if consumed[other_index]:
+                    continue
+                other = merged[other_index]
+                if _should_merge_boxes(
+                    current,
+                    other,
+                    gap=gap,
+                    min_overlap_fraction=min_overlap_fraction,
+                    max_area_ratio=max_area_ratio,
+                ):
+                    current = _combine_boxes(current, other)
+                    consumed[other_index] = True
+                    changed = True
+            consumed[index] = True
+            next_boxes.append(current)
+        merged = next_boxes
+    return merged
+
+
+def _expand_boxes(
+    boxes: list[CropBox],
+    *,
+    padding: int,
+    image_shape: tuple[int, int],
+) -> list[CropBox]:
+    if padding <= 0:
+        return list(boxes)
+    height, width = image_shape
+    expanded: list[CropBox] = []
+    for box in boxes:
+        expanded.append(
+            CropBox(
+                y0=max(0, box.y0 - padding),
+                y1=min(height, box.y1 + padding),
+                x0=max(0, box.x0 - padding),
+                x1=min(width, box.x1 + padding),
+                label=box.label,
+                area=box.area,
+                centroid_y=box.centroid_y,
+                centroid_x=box.centroid_x,
+            )
+        )
+    return expanded
+
+
+def _should_merge_boxes(
+    first: CropBox,
+    second: CropBox,
+    *,
+    gap: int,
+    min_overlap_fraction: float,
+    max_area_ratio: float,
+) -> bool:
+    horizontal_gap = _axis_gap(first.x0, first.x1, second.x0, second.x1)
+    vertical_gap = _axis_gap(first.y0, first.y1, second.y0, second.y1)
+    horizontal_overlap = _axis_overlap(first.x0, first.x1, second.x0, second.x1)
+    vertical_overlap = _axis_overlap(first.y0, first.y1, second.y0, second.y1)
+
+    min_height = max(1, min(first.height, second.height))
+    min_width = max(1, min(first.width, second.width))
+    vertical_overlap_fraction = vertical_overlap / min_height
+    horizontal_overlap_fraction = horizontal_overlap / min_width
+    smaller_area = min(first.area, second.area)
+    larger_area = max(first.area, second.area, 1)
+    smaller_box_area = min(first.height * first.width, second.height * second.width)
+    larger_box_area = max(first.height * first.width, second.height * second.width, 1)
+    fragment_like = (
+        (smaller_area / larger_area) <= max_area_ratio
+        or (smaller_box_area / larger_box_area) <= max_area_ratio
+    )
+
+    if not fragment_like:
+        return False
+
+    if horizontal_gap <= gap and vertical_overlap_fraction >= min_overlap_fraction:
+        return True
+    if vertical_gap <= gap and horizontal_overlap_fraction >= min_overlap_fraction:
+        return True
+    return False
+
+
+def _combine_boxes(first: CropBox, second: CropBox) -> CropBox:
+    combined_area = first.area + second.area
+    centroid_y = ((first.centroid_y * first.area) + (second.centroid_y * second.area)) / max(1, combined_area)
+    centroid_x = ((first.centroid_x * first.area) + (second.centroid_x * second.area)) / max(1, combined_area)
+    return CropBox(
+        y0=min(first.y0, second.y0),
+        y1=max(first.y1, second.y1),
+        x0=min(first.x0, second.x0),
+        x1=max(first.x1, second.x1),
+        label=min(first.label, second.label),
+        area=combined_area,
+        centroid_y=float(centroid_y),
+        centroid_x=float(centroid_x),
+    )
+
+
 def _intersection_area(a: CropBox, b: CropBox) -> int:
     x0 = max(a.x0, b.x0)
     y0 = max(a.y0, b.y0)
@@ -297,3 +429,15 @@ def _intersection_area(a: CropBox, b: CropBox) -> int:
     if x1 <= x0 or y1 <= y0:
         return 0
     return (x1 - x0) * (y1 - y0)
+
+
+def _axis_overlap(a0: int, a1: int, b0: int, b1: int) -> int:
+    return max(0, min(a1, b1) - max(a0, b0))
+
+
+def _axis_gap(a0: int, a1: int, b0: int, b1: int) -> int:
+    if _axis_overlap(a0, a1, b0, b1) > 0:
+        return 0
+    if a1 < b0:
+        return b0 - a1
+    return a0 - b1
