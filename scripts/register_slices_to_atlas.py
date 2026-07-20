@@ -16,10 +16,101 @@ def main() -> None:
     parser.add_argument("pairing_manifest", type=Path, help="Path to the slice_atlas pairing manifest.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for warped sections and registration overlays.")
     parser.add_argument("--tissue-threshold-quantile", type=float, default=0.8, help="Quantile used to derive the section tissue mask.")
-    parser.add_argument("--max-rotation-degrees", type=float, default=35.0, help="Allowed rotation search range around the initial estimate.")
-    parser.add_argument("--min-scale-factor", type=float, default=0.6, help="Lower scale bound relative to the initial estimate.")
-    parser.add_argument("--max-scale-factor", type=float, default=1.6, help="Upper scale bound relative to the initial estimate.")
+    parser.add_argument("--max-rotation-degrees", type=float, default=0.0, help="Allowed rotation search range around the initial estimate.")
+    parser.add_argument("--min-scale-factor", type=float, default=0.8, help="Lower scale bound relative to the initial estimate.")
+    parser.add_argument("--max-scale-factor", type=float, default=1.0, help="Upper scale bound relative to the initial estimate.")
     parser.add_argument("--translation-search-fraction", type=float, default=0.25, help="Allowed translation search range as a fraction of atlas height/width.")
+    parser.add_argument(
+        "--transform-model",
+        choices=("similarity", "affine"),
+        default="similarity",
+        help="Final transform model. affine adds constrained anisotropic scale and shear refinement after similarity fitting.",
+    )
+    parser.add_argument(
+        "--initial-rotation-degrees",
+        type=float,
+        default=0.0,
+        help="Initial rotation for similarity search. Default keeps slide orientation neutral.",
+    )
+    parser.add_argument(
+        "--use-mask-orientation-initialization",
+        action="store_true",
+        help="Initialize rotation from mask moments instead of --initial-rotation-degrees.",
+    )
+    parser.add_argument(
+        "--scale-initialization",
+        choices=("bbox_fit", "area"),
+        default="bbox_fit",
+        help="How to estimate the initial section-to-atlas scale.",
+    )
+    parser.add_argument(
+        "--translation-initialization",
+        choices=("crop_center", "tissue_centroid"),
+        default="tissue_centroid",
+        help="How to initialize translation. tissue_centroid maps section tissue centroid to atlas centroid.",
+    )
+    parser.add_argument(
+        "--max-affine-anisotropy",
+        type=float,
+        default=0.10,
+        help="Maximum fractional y/x scale imbalance for --transform-model affine.",
+    )
+    parser.add_argument(
+        "--max-affine-shear",
+        type=float,
+        default=0.04,
+        help="Maximum shear coefficient for --transform-model affine.",
+    )
+    parser.add_argument(
+        "--affine-regularization-weight",
+        type=float,
+        default=0.08,
+        help="Penalty weight for affine anisotropy and shear.",
+    )
+    parser.add_argument("--area-loss-weight", type=float, default=0.2, help="Penalty weight for warped-mask area mismatch.")
+    parser.add_argument("--extent-loss-weight", type=float, default=0.8, help="Penalty weight for warped-mask bounding-box mismatch.")
+    parser.add_argument("--center-loss-weight", type=float, default=0.4, help="Penalty weight for warped-mask center offset.")
+    parser.add_argument(
+        "--show-crop-background",
+        action="store_true",
+        help="Show the full warped rectangular crop in overlay PNGs instead of masking the section display to tissue.",
+    )
+    parser.add_argument(
+        "--overlay-mask-threshold-quantile",
+        type=float,
+        default=0.45,
+        help="Permissive threshold quantile used only to hide crop background in overlay PNGs.",
+    )
+    parser.add_argument(
+        "--overlay-mask-dilation-px",
+        type=int,
+        default=6,
+        help="Pixels of dilation applied to the overlay display mask after thresholding.",
+    )
+    parser.add_argument(
+        "--boundary-fit-threshold-quantile",
+        type=float,
+        default=0.35,
+        help="Lower-threshold quantile used for outer-boundary scale containment during registration.",
+    )
+    parser.add_argument(
+        "--boundary-fit-dilation-px",
+        type=int,
+        default=0,
+        help="Pixels of dilation applied to the outer-boundary fit mask.",
+    )
+    parser.add_argument(
+        "--boundary-fit-weight",
+        type=float,
+        default=0.35,
+        help="Weight for matching the outer slice boundary to the atlas mask.",
+    )
+    parser.add_argument(
+        "--boundary-containment-weight",
+        type=float,
+        default=1.2,
+        help="Weight for penalizing outer slice boundary outside the atlas mask.",
+    )
     args = parser.parse_args()
 
     config = SliceRegistrationConfig(
@@ -28,6 +119,23 @@ def main() -> None:
         min_scale_factor=args.min_scale_factor,
         max_scale_factor=args.max_scale_factor,
         translation_search_fraction=args.translation_search_fraction,
+        transform_model=args.transform_model,
+        initial_rotation_degrees=None if args.use_mask_orientation_initialization else args.initial_rotation_degrees,
+        scale_initialization=args.scale_initialization,
+        translation_initialization=args.translation_initialization,
+        max_affine_anisotropy=args.max_affine_anisotropy,
+        max_affine_shear=args.max_affine_shear,
+        affine_regularization_weight=args.affine_regularization_weight,
+        area_loss_weight=args.area_loss_weight,
+        extent_loss_weight=args.extent_loss_weight,
+        center_loss_weight=args.center_loss_weight,
+        mask_overlay_to_tissue=not args.show_crop_background,
+        overlay_mask_threshold_quantile=args.overlay_mask_threshold_quantile,
+        overlay_mask_dilation_px=args.overlay_mask_dilation_px,
+        boundary_fit_threshold_quantile=args.boundary_fit_threshold_quantile,
+        boundary_fit_dilation_px=args.boundary_fit_dilation_px,
+        boundary_fit_weight=args.boundary_fit_weight,
+        boundary_containment_weight=args.boundary_containment_weight,
     )
     result = register_slices_to_atlas(args.pairing_manifest, args.output_dir, config=config)
     print(f"Slice registration output directory: {result.output_dir}")

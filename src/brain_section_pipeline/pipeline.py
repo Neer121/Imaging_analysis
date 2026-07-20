@@ -43,6 +43,7 @@ class PipelineConfig:
     crop_output_mode: str = "rgb_direct"
     rgb_direct_channels: Sequence[int | None] = (2, 1, 0)
     save_raw_channel_crops: bool = False
+    preview_max_dim: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,8 +86,9 @@ def process_nd2_file(
         z_index=cfg.z_index,
         z_projection=cfg.z_projection,
     )
+    preview_source = _preview_source_image(nd2_image.data, cfg.preview_max_dim)
     rgb = merge_channels(
-        nd2_image.data,
+        preview_source,
         channel_colors=cfg.channel_colors,
         percentiles=cfg.percentiles,
         channels=cfg.merge_channels,
@@ -112,17 +114,29 @@ def process_nd2_file(
     crop_dir = Path(crop_output_dir) if crop_output_dir is not None else file_output_dir
 
     imwrite(merged_path, rgb)
-    _save_overlay(rgb, detection.boxes, overlay_path)
-    crop_source = _crop_output_image(nd2_image.data, rgb, cfg)
-    crop_paths = save_crops(
-        crop_source,
-        detection.boxes,
-        crop_dir,
-        stem=crop_stem or input_path.stem,
-        extension=cfg.output_extension,
-        start_index=crop_start_index,
-        filename_template=crop_filename_template,
-    )
+    _save_overlay(rgb, detection.boxes, overlay_path, source_shape=detection.mask.shape)
+    if cfg.crop_output_mode == "rgb_direct":
+        crop_paths = _save_rgb_direct_crops(
+            nd2_image.data,
+            detection.boxes,
+            crop_dir,
+            stem=crop_stem or input_path.stem,
+            extension=cfg.output_extension,
+            start_index=crop_start_index,
+            filename_template=crop_filename_template,
+            rgb_channels=cfg.rgb_direct_channels,
+        )
+    else:
+        crop_source = _crop_output_image(nd2_image.data, rgb, cfg)
+        crop_paths = save_crops(
+            crop_source,
+            detection.boxes,
+            crop_dir,
+            stem=crop_stem or input_path.stem,
+            extension=cfg.output_extension,
+            start_index=crop_start_index,
+            filename_template=crop_filename_template,
+        )
 
     raw_crop_paths: list[Path] = []
     if cfg.save_raw_channel_crops:
@@ -221,12 +235,80 @@ def _raw_channels_to_rgb(
     return rgb
 
 
-def _save_overlay(rgb: np.ndarray, boxes: list[CropBox], output_path: Path) -> None:
+def _save_rgb_direct_crops(
+    raw_channels: np.ndarray,
+    boxes: list[CropBox],
+    output_dir: str | Path,
+    *,
+    stem: str,
+    extension: str,
+    start_index: int,
+    filename_template: str,
+    rgb_channels: Sequence[int | None],
+) -> list[Path]:
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index, box in enumerate(boxes, start=start_index):
+        y_slice, x_slice = box.as_slices()
+        crop = np.asarray(raw_channels)[..., y_slice, x_slice]
+        rgb_crop = _raw_channels_to_rgb(crop, rgb_channels)
+        filename = filename_template.format(stem=stem, index=index, extension=extension)
+        path = out_dir / filename
+        imwrite(path, rgb_crop)
+        paths.append(path)
+    return paths
+
+
+def _preview_source_image(image: np.ndarray, preview_max_dim: int | None) -> np.ndarray:
+    if preview_max_dim is None or preview_max_dim <= 0:
+        return image
+
+    array = np.asarray(image)
+    if array.ndim == 2:
+        height, width = array.shape
+    elif array.ndim == 3 and array.shape[0] <= 8:
+        height, width = array.shape[1:]
+    elif array.ndim == 3 and array.shape[-1] <= 8:
+        height, width = array.shape[:2]
+    else:
+        return image
+
+    max_dim = max(height, width)
+    if max_dim <= preview_max_dim:
+        return image
+
+    step = int(np.ceil(max_dim / float(preview_max_dim)))
+    if array.ndim == 2:
+        return array[::step, ::step]
+    if array.shape[0] <= 8:
+        return array[:, ::step, ::step]
+    return array[::step, ::step, :]
+
+
+def _save_overlay(
+    rgb: np.ndarray,
+    boxes: list[CropBox],
+    output_path: Path,
+    *,
+    source_shape: tuple[int, int] | None = None,
+) -> None:
     image = Image.fromarray(rgb.astype(np.uint8), mode="RGB")
     draw = ImageDraw.Draw(image)
+    if source_shape is None:
+        scale_y = 1.0
+        scale_x = 1.0
+    else:
+        scale_y = rgb.shape[0] / max(1.0, float(source_shape[0]))
+        scale_x = rgb.shape[1] / max(1.0, float(source_shape[1]))
     for index, box in enumerate(boxes, start=1):
-        draw.rectangle((box.x0, box.y0, box.x1, box.y1), outline=(255, 64, 64), width=4)
-        draw.text((box.x0 + 8, box.y0 + 8), str(index), fill=(255, 255, 0))
+        x0 = int(round(box.x0 * scale_x))
+        x1 = int(round(box.x1 * scale_x))
+        y0 = int(round(box.y0 * scale_y))
+        y1 = int(round(box.y1 * scale_y))
+        line_width = max(1, int(round(4 * max(scale_x, scale_y))))
+        draw.rectangle((x0, y0, x1, y1), outline=(255, 64, 64), width=line_width)
+        draw.text((x0 + 8, y0 + 8), str(index), fill=(255, 255, 0))
     image.save(output_path)
 
 

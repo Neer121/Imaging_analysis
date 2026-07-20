@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 from tifffile import imread
 from tifffile import imwrite
@@ -13,11 +14,21 @@ from brain_section_pipeline import select_nd2_files_dialog
 from brain_section_pipeline.crop import CropBox, crop_sections, detect_section_crops, save_crops, sort_crop_boxes
 from brain_section_pipeline.export import BrainGlobeExportConfig, _capture_atlas_metadata, export_sections_for_brainglobe
 from brain_section_pipeline.merge import merge_channels, robust_scale
-from brain_section_pipeline.pipeline import ProcessingResult, _raw_channels_to_rgb
+from brain_section_pipeline.pipeline import ProcessingResult, _preview_source_image, _raw_channels_to_rgb, _save_rgb_direct_crops
 from brain_section_pipeline.brainreg_runner import BrainRegConfig, prepare_brainreg_run, run_prepared_brainreg
 from brain_section_pipeline.stack import StackBuildConfig, build_stack_from_manifest
 from brain_section_pipeline.atlas_summary import AtlasSummaryConfig, summarize_registered_slices_by_region
+from brain_section_pipeline.atlas_indexing import (
+    AtlasIndexSuggestionConfig,
+    ap_mm_to_atlas_index,
+    atlas_native_ap_mm_to_coordinate_ap_mm,
+    atlas_index_to_ap_mm,
+    coordinate_ap_mm_to_atlas_native_ap_mm,
+    export_selected_atlas_previews,
+    suggest_atlas_indices,
+)
 from brain_section_pipeline.qc import SliceAtlasQcConfig, generate_slice_atlas_qc
+import brain_section_pipeline.atlas_indexing as atlas_indexing_module
 import brain_section_pipeline.slice_registration as slice_registration_module
 import brain_section_pipeline.workflow as workflow_module
 from brain_section_pipeline.slice_registration import SliceRegistrationConfig, register_slices_to_atlas
@@ -288,6 +299,43 @@ def test_raw_channels_to_rgb_direct_mapping_is_demixable():
     np.testing.assert_array_equal(rgb[..., 0], raw[2])
     np.testing.assert_array_equal(rgb[..., 1], raw[1])
     np.testing.assert_array_equal(rgb[..., 2], raw[0])
+
+
+def test_preview_source_image_downsamples_large_channel_first_arrays():
+    image = np.zeros((4, 100, 220), dtype=np.uint16)
+
+    preview = _preview_source_image(image, preview_max_dim=50)
+
+    assert preview.shape == (4, 20, 44)
+
+
+def test_save_rgb_direct_crops_writes_each_crop_without_full_rgb_canvas(tmp_path):
+    image = np.zeros((4, 20, 30), dtype=np.uint16)
+    image[0] = 10
+    image[1] = 20
+    image[2] = 30
+    boxes = [
+        CropBox(y0=2, y1=8, x0=3, x1=13, label=1, area=60, centroid_y=5.0, centroid_x=8.0),
+        CropBox(y0=10, y1=18, x0=15, x1=25, label=2, area=80, centroid_y=14.0, centroid_x=20.0),
+    ]
+
+    paths = _save_rgb_direct_crops(
+        image,
+        boxes,
+        tmp_path,
+        stem="section",
+        extension="tif",
+        start_index=1,
+        filename_template="{stem}{index:03d}.{extension}",
+        rgb_channels=(2, 1, 0),
+    )
+
+    assert [path.name for path in paths] == ["section001.tif", "section002.tif"]
+    first = imread(paths[0])
+    assert first.shape == (6, 10, 3)
+    assert np.all(first[..., 0] == 30)
+    assert np.all(first[..., 1] == 20)
+    assert np.all(first[..., 2] == 10)
 
 
 def test_export_sections_for_brainglobe_writes_manifest_and_channel_exports(tmp_path, monkeypatch):
@@ -792,6 +840,553 @@ def test_prepare_slice_atlas_inputs_raises_without_brainglobe(monkeypatch, tmp_p
         raise AssertionError("Expected prepare_slice_atlas_inputs to raise ImportError.")
 
 
+def test_atlas_index_ap_conversion_matches_whs_axis_convention():
+    shape = (1024, 512, 512)
+    resolution = (39.0, 39.0, 39.0)
+
+    assert ap_mm_to_atlas_index(-7.30, shape=shape, resolution_um=resolution, orientation="asr") == 699
+    assert atlas_index_to_ap_mm(699, shape=shape, resolution_um=resolution, orientation="asr") == pytest.approx(-7.293)
+
+
+def test_atlas_index_ap_conversion_supports_paxinos_offset():
+    shape = (1024, 512, 512)
+    resolution = (39.0, 39.0, 39.0)
+
+    assert coordinate_ap_mm_to_atlas_native_ap_mm(
+        -7.80,
+        coordinate_system="paxinos",
+        ap_coordinate_offset_mm=0.50,
+    ) == pytest.approx(-7.30)
+    assert atlas_native_ap_mm_to_coordinate_ap_mm(
+        -7.30,
+        coordinate_system="paxinos",
+        ap_coordinate_offset_mm=0.50,
+    ) == pytest.approx(-7.80)
+    assert (
+        ap_mm_to_atlas_index(
+            -7.80,
+            shape=shape,
+            resolution_um=resolution,
+            orientation="asr",
+            coordinate_system="paxinos",
+            ap_coordinate_offset_mm=0.50,
+        )
+        == 699
+    )
+    assert atlas_index_to_ap_mm(
+        699,
+        shape=shape,
+        resolution_um=resolution,
+        orientation="asr",
+        coordinate_system="paxinos",
+        ap_coordinate_offset_mm=0.50,
+    ) == pytest.approx(-7.793)
+
+
+def test_atlas_candidate_score_penalizes_oversized_visible_boundary():
+    base_registration = {
+        "status": "ok",
+        "dice": 0.55,
+        "iou": 0.38,
+        "loss": 0.95,
+        "warped_area_ratio": 1.0,
+        "warped_extent_y_ratio": 1.0,
+        "warped_extent_x_ratio": 1.0,
+        "warped_center_y_offset": 0.0,
+        "warped_center_x_offset": 0.0,
+        "boundary_area_ratio": 1.0,
+        "boundary_extent_y_ratio": 1.0,
+        "boundary_extent_x_ratio": 1.0,
+        "boundary_outside_fraction": 0.02,
+    }
+    oversized_boundary = {
+        **base_registration,
+        "boundary_area_ratio": 1.3,
+        "boundary_extent_y_ratio": 1.15,
+        "boundary_extent_x_ratio": 1.12,
+        "boundary_outside_fraction": 0.25,
+    }
+
+    assert atlas_indexing_module._candidate_score(base_registration) > atlas_indexing_module._candidate_score(
+        oversized_boundary
+    )
+
+
+def test_atlas_candidate_score_penalizes_boundary_distance_and_dorsal_anchor_mismatch():
+    base_registration = {
+        "status": "ok",
+        "dice": 0.55,
+        "iou": 0.38,
+        "loss": 0.95,
+        "warped_area_ratio": 1.0,
+        "warped_extent_y_ratio": 1.0,
+        "warped_extent_x_ratio": 1.0,
+        "warped_center_y_offset": 0.0,
+        "warped_center_x_offset": 0.0,
+        "boundary_area_ratio": 1.0,
+        "boundary_extent_y_ratio": 1.0,
+        "boundary_extent_x_ratio": 1.0,
+        "boundary_outside_fraction": 0.02,
+        "boundary_distance_norm": 0.02,
+        "dorsal_midline_distance": 0.01,
+    }
+    mismatched = {
+        **base_registration,
+        "boundary_distance_norm": 0.20,
+        "dorsal_midline_distance": 0.30,
+    }
+
+    assert atlas_indexing_module._candidate_score(base_registration) > atlas_indexing_module._candidate_score(mismatched)
+
+
+def test_dorsal_midline_anchor_detects_central_notch():
+    mask = np.zeros((70, 100), dtype=bool)
+    for x in range(20, 81):
+        top = 10
+        if 45 <= x <= 55:
+            top = 20
+        mask[top:55, x] = True
+
+    anchor = atlas_indexing_module._dorsal_midline_anchor(mask)
+
+    assert anchor is not None
+    assert anchor["detected"]
+    assert anchor["x"] == pytest.approx(50, abs=6)
+    assert anchor["y"] >= 18
+
+
+def test_anatomical_alignment_metrics_penalize_shifted_boundary_and_notch():
+    atlas_mask = np.zeros((80, 120), dtype=bool)
+    section_mask = np.zeros_like(atlas_mask)
+    shifted_section_mask = np.zeros_like(atlas_mask)
+    for x in range(25, 96):
+        top = 12 if not 54 <= x <= 66 else 22
+        atlas_mask[top:64, x] = True
+        section_mask[top:64, x] = True
+    shifted_section_mask[16:68, 31:102] = section_mask[12:64, 25:96]
+
+    aligned = atlas_indexing_module._anatomical_alignment_metrics({"_warped_boundary_mask": section_mask}, atlas_mask)
+    shifted = atlas_indexing_module._anatomical_alignment_metrics(
+        {"_warped_boundary_mask": shifted_section_mask},
+        atlas_mask,
+    )
+
+    assert aligned["boundary_distance_norm"] < shifted["boundary_distance_norm"]
+    assert aligned["dorsal_midline_distance"] < shifted["dorsal_midline_distance"]
+
+
+def test_suggest_atlas_indices_writes_selected_manifest_and_review_candidates(tmp_path, monkeypatch):
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+
+        def __init__(self):
+            self.reference = np.zeros((7, 40, 50), dtype=np.float32)
+            self.annotation = np.zeros((7, 40, 50), dtype=np.uint16)
+            self.reference[2, 11:29, 16:34] = 80
+            self.annotation[2, 11:29, 16:34] = 1
+            self.reference[3, 10:30, 14:36] = 120
+            self.annotation[3, 10:30, 14:36] = 1
+            self.reference[4, 8:34, 10:42] = 60
+            self.annotation[4, 8:34, 10:42] = 1
+
+    monkeypatch.setattr("brain_section_pipeline.atlas_indexing._load_atlas", lambda atlas_name: FakeAtlas())
+
+    section_path = tmp_path / "section001.tif"
+    section = np.zeros((40, 50), dtype=np.float32)
+    section[10:30, 14:36] = 500
+    imwrite(section_path, section)
+
+    manifest_path = tmp_path / "section_manifest.csv"
+    rows = [
+        {
+            "sample_id": "rat_01",
+            "atlas_name": "fake",
+            "source_file": "slide.nd2",
+            "slide_number": "1",
+            "slide_id": "slide",
+            "section_index": "1",
+            "crop_path_rgb": str(section_path),
+            "crop_path_registration": str(section_path),
+            "raw_crop_path": str(section_path),
+            "channel_count": "1",
+            "channel_paths": "{}",
+            "registration_channel": "0",
+            "include_in_stack": "True",
+            "qc_status": "pending",
+        }
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = suggest_atlas_indices(
+        manifest_path,
+        config=AtlasIndexSuggestionConfig(
+            atlas_name="fake",
+            start_slice_index=3,
+            search_radius_slices=1,
+            top_n=2,
+        ),
+    )
+
+    candidate_rows = list(csv.DictReader(result.candidate_manifest_path.open(newline="", encoding="utf-8")))
+    selected_rows = list(csv.DictReader(result.selected_manifest_path.open(newline="", encoding="utf-8")))
+    choices = list(csv.DictReader(result.selected_choices_path.open(newline="", encoding="utf-8")))
+
+    assert len(candidate_rows) == 2
+    assert len(result.review_grid_paths) == 1
+    assert result.review_grid_paths[0].exists()
+    assert len(result.atlas_preview_paths) == 1
+    assert result.atlas_preview_paths[0].exists()
+    assert result.atlas_preview_contact_sheet_path is not None
+    assert result.atlas_preview_contact_sheet_path.exists()
+    assert selected_rows[0]["atlas_slice_index"] == choices[0]["selected_atlas_slice_index"]
+    assert Path(selected_rows[0]["atlas_reference_path"]).exists()
+    assert Path(selected_rows[0]["atlas_annotation_path"]).exists()
+    assert Path(selected_rows[0]["atlas_index_selected_atlas_preview_path"]).exists()
+    assert Path(choices[0]["selected_atlas_preview_path"]).exists()
+    assert Path(candidate_rows[0]["overlay_path"]).exists()
+
+
+def test_export_selected_atlas_previews_from_existing_selected_manifest(tmp_path):
+    reference_path = tmp_path / "atlas_reference.tif"
+    annotation_path = tmp_path / "atlas_annotation.tif"
+    reference = np.zeros((32, 40), dtype=np.float32)
+    reference[8:26, 9:31] = 100.0
+    annotation = np.zeros((32, 40), dtype=np.uint16)
+    annotation[10:24, 12:28] = 1
+    imwrite(reference_path, reference)
+    imwrite(annotation_path, annotation)
+
+    manifest_path = tmp_path / "selected_slice_atlas_manifest.csv"
+    rows = [
+        {
+            "section_index": "1",
+            "atlas_slice_index": "439",
+            "atlas_ap_mm": "2.847",
+            "atlas_native_ap_mm": "2.847",
+            "ap_coordinate_system": "paxinos",
+            "atlas_reference_path": str(reference_path),
+            "atlas_annotation_path": str(annotation_path),
+        }
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = export_selected_atlas_previews(manifest_path)
+
+    assert len(result.preview_paths) == 1
+    assert result.preview_paths[0].exists()
+    assert result.contact_sheet_path is not None
+    assert result.contact_sheet_path.exists()
+    preview = Image.open(result.preview_paths[0]).convert("RGB")
+    assert preview.width > 0
+    assert preview.height > reference.shape[0]
+
+
+def test_suggest_atlas_indices_can_lock_later_sections_to_first_selected_spacing(tmp_path, monkeypatch):
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+
+        def __init__(self):
+            self.reference = np.zeros((7, 40, 50), dtype=np.float32)
+            self.annotation = np.zeros((7, 40, 50), dtype=np.uint16)
+            self.reference[2, 10:30, 14:36] = 120
+            self.annotation[2, 10:30, 14:36] = 1
+            self.reference[3, 12:28, 18:32] = 90
+            self.annotation[3, 12:28, 18:32] = 1
+            self.reference[4, 5:34, 9:43] = 120
+            self.annotation[4, 5:34, 9:43] = 1
+
+    monkeypatch.setattr("brain_section_pipeline.atlas_indexing._load_atlas", lambda atlas_name: FakeAtlas())
+
+    section_dir = tmp_path / "sections"
+    section_dir.mkdir()
+    section_one_path = section_dir / "section001.tif"
+    section_two_path = section_dir / "section002.tif"
+
+    section_one = np.zeros((40, 50), dtype=np.float32)
+    section_one[10:30, 14:36] = 500
+    imwrite(section_one_path, section_one)
+
+    section_two = np.zeros((40, 50), dtype=np.float32)
+    section_two[5:34, 9:43] = 500
+    imwrite(section_two_path, section_two)
+
+    manifest_path = tmp_path / "section_manifest.csv"
+    rows = [
+        {
+            "sample_id": "rat_01",
+            "atlas_name": "fake",
+            "source_file": "slide.nd2",
+            "slide_number": "1",
+            "slide_id": "slide",
+            "section_index": str(section_index),
+            "crop_path_rgb": str(section_path),
+            "crop_path_registration": str(section_path),
+            "raw_crop_path": str(section_path),
+            "channel_count": "1",
+            "channel_paths": "{}",
+            "registration_channel": "0",
+            "include_in_stack": "True",
+            "qc_status": "pending",
+        }
+        for section_index, section_path in ((1, section_one_path), (2, section_two_path))
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = suggest_atlas_indices(
+        manifest_path,
+        config=AtlasIndexSuggestionConfig(
+            atlas_name="fake",
+            start_slice_index=6,
+            section_interval_um=39.0,
+            direction="posterior",
+            selection_strategy="spacing_locked",
+            search_radius_slices=1,
+            anchor_search_radius_slices=4,
+            anchor_search_stride_slices=2,
+            anchor_refine_radius_slices=0,
+            top_n=3,
+        ),
+    )
+
+    choices = list(csv.DictReader(result.selected_choices_path.open(newline="", encoding="utf-8")))
+    candidate_rows = list(csv.DictReader(result.candidate_manifest_path.open(newline="", encoding="utf-8")))
+    selected_section_one = [
+        row for row in candidate_rows if row["section_index"] == "1" and row["is_selected"] == "True"
+    ][0]
+    selected_section_two = [
+        row for row in candidate_rows if row["section_index"] == "2" and row["is_selected"] == "True"
+    ][0]
+
+    assert [row["selected_atlas_slice_index"] for row in choices] == ["2", "3"]
+    assert choices[1]["selection_strategy"] == "spacing_locked"
+    assert selected_section_one["search_radius_slices"] == "4"
+    assert selected_section_two["search_radius_slices"] == "1"
+    assert selected_section_two["atlas_slice_index"] == "3"
+
+
+def test_suggest_atlas_indices_respects_ap_bounds(tmp_path, monkeypatch):
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+
+        def __init__(self):
+            self.reference = np.zeros((7, 40, 50), dtype=np.float32)
+            self.annotation = np.zeros((7, 40, 50), dtype=np.uint16)
+            self.reference[1, 6:35, 8:42] = 90
+            self.annotation[1, 6:35, 8:42] = 1
+            self.reference[2, 10:30, 14:36] = 120
+            self.annotation[2, 10:30, 14:36] = 1
+            self.reference[3, 12:28, 18:32] = 90
+            self.annotation[3, 12:28, 18:32] = 1
+
+    monkeypatch.setattr("brain_section_pipeline.atlas_indexing._load_atlas", lambda atlas_name: FakeAtlas())
+
+    section_path = tmp_path / "section001.tif"
+    section = np.zeros((40, 50), dtype=np.float32)
+    section[10:30, 14:36] = 500
+    imwrite(section_path, section)
+
+    manifest_path = tmp_path / "section_manifest.csv"
+    rows = [
+        {
+            "sample_id": "rat_01",
+            "atlas_name": "fake",
+            "source_file": "slide.nd2",
+            "slide_number": "1",
+            "slide_id": "slide",
+            "section_index": "1",
+            "crop_path_rgb": str(section_path),
+            "crop_path_registration": str(section_path),
+            "raw_crop_path": str(section_path),
+            "channel_count": "1",
+            "channel_paths": "{}",
+            "registration_channel": "0",
+            "include_in_stack": "True",
+            "qc_status": "pending",
+        }
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = suggest_atlas_indices(
+        manifest_path,
+        config=AtlasIndexSuggestionConfig(
+            atlas_name="fake",
+            start_slice_index=6,
+            search_radius_slices=6,
+            min_ap_mm=0.04,
+            max_ap_mm=0.07,
+            top_n=3,
+        ),
+    )
+
+    choices = list(csv.DictReader(result.selected_choices_path.open(newline="", encoding="utf-8")))
+    candidate_rows = list(csv.DictReader(result.candidate_manifest_path.open(newline="", encoding="utf-8")))
+
+    assert choices[0]["selected_atlas_slice_index"] == "2"
+    assert {row["atlas_slice_index"] for row in candidate_rows} == {"2"}
+    assert "base_score" in candidate_rows[0]
+    assert "ap_prior_penalty" in candidate_rows[0]
+
+
+def test_suggest_atlas_indices_respects_paxinos_ap_bounds_with_offset(tmp_path, monkeypatch):
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+
+        def __init__(self):
+            self.reference = np.zeros((7, 40, 50), dtype=np.float32)
+            self.annotation = np.zeros((7, 40, 50), dtype=np.uint16)
+            self.reference[1, 6:35, 8:42] = 90
+            self.annotation[1, 6:35, 8:42] = 1
+            self.reference[2, 10:30, 14:36] = 120
+            self.annotation[2, 10:30, 14:36] = 1
+            self.reference[3, 12:28, 18:32] = 90
+            self.annotation[3, 12:28, 18:32] = 1
+
+    monkeypatch.setattr("brain_section_pipeline.atlas_indexing._load_atlas", lambda atlas_name: FakeAtlas())
+
+    section_path = tmp_path / "section001.tif"
+    section = np.zeros((40, 50), dtype=np.float32)
+    section[10:30, 14:36] = 500
+    imwrite(section_path, section)
+
+    manifest_path = tmp_path / "section_manifest.csv"
+    rows = [
+        {
+            "sample_id": "rat_01",
+            "atlas_name": "fake",
+            "source_file": "slide.nd2",
+            "slide_number": "1",
+            "slide_id": "slide",
+            "section_index": "1",
+            "crop_path_rgb": str(section_path),
+            "crop_path_registration": str(section_path),
+            "raw_crop_path": str(section_path),
+            "channel_count": "1",
+            "channel_paths": "{}",
+            "registration_channel": "0",
+            "include_in_stack": "True",
+            "qc_status": "pending",
+        }
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = suggest_atlas_indices(
+        manifest_path,
+        config=AtlasIndexSuggestionConfig(
+            atlas_name="fake",
+            start_slice_index=6,
+            search_radius_slices=6,
+            ap_coordinate_system="paxinos",
+            ap_coordinate_offset_mm=0.5,
+            min_ap_mm=-0.45,
+            max_ap_mm=-0.43,
+            top_n=3,
+        ),
+    )
+
+    choices = list(csv.DictReader(result.selected_choices_path.open(newline="", encoding="utf-8")))
+    candidate_rows = list(csv.DictReader(result.candidate_manifest_path.open(newline="", encoding="utf-8")))
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert choices[0]["selected_atlas_slice_index"] == "2"
+    assert {row["atlas_slice_index"] for row in candidate_rows} == {"2"}
+    assert choices[0]["ap_coordinate_system"] == "paxinos"
+    assert float(choices[0]["selected_ap_mm"]) == pytest.approx(-0.4415)
+    assert float(choices[0]["selected_native_ap_mm"]) == pytest.approx(0.0585)
+    assert float(candidate_rows[0]["atlas_ap_mm"]) == pytest.approx(-0.4415)
+    assert float(candidate_rows[0]["atlas_native_ap_mm"]) == pytest.approx(0.0585)
+    assert metadata["ap_coordinate_system"] == "paxinos"
+    assert metadata["ap_coordinate_offset_mm"] == pytest.approx(0.5)
+
+
+def test_suggest_atlas_indices_can_estimate_ap_bounds_from_first_section(tmp_path, monkeypatch):
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+
+        def __init__(self):
+            self.reference = np.zeros((7, 40, 50), dtype=np.float32)
+            self.annotation = np.zeros((7, 40, 50), dtype=np.uint16)
+            self.reference[1, 6:35, 8:42] = 90
+            self.annotation[1, 6:35, 8:42] = 1
+            self.reference[2, 10:30, 14:36] = 120
+            self.annotation[2, 10:30, 14:36] = 1
+            self.reference[3, 12:28, 18:32] = 90
+            self.annotation[3, 12:28, 18:32] = 1
+
+    monkeypatch.setattr("brain_section_pipeline.atlas_indexing._load_atlas", lambda atlas_name: FakeAtlas())
+
+    section_path = tmp_path / "section001.tif"
+    section = np.zeros((40, 50), dtype=np.float32)
+    section[10:30, 14:36] = 500
+    imwrite(section_path, section)
+
+    manifest_path = tmp_path / "section_manifest.csv"
+    rows = [
+        {
+            "sample_id": "rat_01",
+            "atlas_name": "fake",
+            "source_file": "slide.nd2",
+            "slide_number": "1",
+            "slide_id": "slide",
+            "section_index": "1",
+            "crop_path_rgb": str(section_path),
+            "crop_path_registration": str(section_path),
+            "raw_crop_path": str(section_path),
+            "channel_count": "1",
+            "channel_paths": "{}",
+            "registration_channel": "0",
+            "include_in_stack": "True",
+            "qc_status": "pending",
+        }
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = suggest_atlas_indices(
+        manifest_path,
+        config=AtlasIndexSuggestionConfig(
+            atlas_name="fake",
+            start_slice_index=6,
+            search_radius_slices=6,
+            auto_ap_range=True,
+            auto_ap_range_stride_slices=1,
+            auto_ap_range_top_n=1,
+            auto_ap_range_padding_mm=0.001,
+            top_n=3,
+        ),
+    )
+
+    choices = list(csv.DictReader(result.selected_choices_path.open(newline="", encoding="utf-8")))
+    candidate_rows = list(csv.DictReader(result.candidate_manifest_path.open(newline="", encoding="utf-8")))
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert choices[0]["selected_atlas_slice_index"] == "2"
+    assert {row["atlas_slice_index"] for row in candidate_rows} == {"2"}
+    assert metadata["auto_ap_range"]["best_atlas_slice_index"] == 2
+    assert float(choices[0]["effective_min_ap_mm"]) < float(choices[0]["effective_max_ap_mm"])
+
+
 def test_generate_slice_atlas_qc_writes_overlay_images(tmp_path):
     pairing_dir = tmp_path / "slice_atlas"
     section_dir = pairing_dir / "sections"
@@ -903,6 +1498,229 @@ def test_register_slices_to_atlas_writes_warped_outputs_and_metrics(tmp_path):
 
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["rows"][0]["registration_dice"] > 0.75
+
+
+def test_slice_registration_initial_scale_uses_bbox_fit_by_default():
+    section_mask = np.zeros((100, 220), dtype=bool)
+    section_mask[10:90, 20:180] = True
+    atlas_mask = np.zeros((80, 100), dtype=bool)
+    atlas_mask[20:60, 30:70] = True
+    atlas_bbox = slice_registration_module._bbox(atlas_mask)
+
+    bbox_fit = slice_registration_module._initial_similarity_parameters(
+        section_mask,
+        atlas_mask,
+        atlas_bbox,
+        SliceRegistrationConfig(),
+    )
+    area_based = slice_registration_module._initial_similarity_parameters(
+        section_mask,
+        atlas_mask,
+        atlas_bbox,
+        SliceRegistrationConfig(scale_initialization="area", initial_rotation_degrees=None),
+    )
+
+    assert bbox_fit[0] == pytest.approx(0.25)
+    assert bbox_fit[1] == pytest.approx(0.0)
+    assert bbox_fit[0] < area_based[0]
+
+
+def test_slice_registration_tissue_centroid_initialization_maps_tissue_to_atlas_centroid():
+    section_mask = np.zeros((20, 30), dtype=bool)
+    section_mask[5:15, 3:13] = True
+    atlas_mask = np.zeros((40, 50), dtype=bool)
+    atlas_mask[10:30, 15:35] = True
+    atlas_bbox = slice_registration_module._bbox(atlas_mask)
+
+    params = slice_registration_module._initial_similarity_parameters(
+        section_mask,
+        atlas_mask,
+        atlas_bbox,
+        SliceRegistrationConfig(
+            translation_initialization="tissue_centroid",
+            initial_rotation_degrees=0.0,
+        ),
+    )
+    matrix = slice_registration_module._similarity_matrix(params[0], params[1], params[2], params[3], section_mask.shape)
+    section_centroid = np.asarray(slice_registration_module._mask_centroid(section_mask))
+    atlas_centroid = np.asarray(slice_registration_module._mask_centroid(atlas_mask))
+    mapped_section_centroid = matrix[:2, :2] @ section_centroid + matrix[:2, 2]
+
+    assert mapped_section_centroid == pytest.approx(atlas_centroid)
+
+
+def test_compose_overlay_can_hide_crop_background_outside_tissue_mask():
+    warped_section = np.full((20, 30), 25.0, dtype=np.float32)
+    warped_section[5:15, 8:22] = 200.0
+    atlas_reference = np.full((20, 30), 100.0, dtype=np.float32)
+    atlas_mask = np.zeros((20, 30), dtype=bool)
+    atlas_mask[4:16, 7:23] = True
+    section_mask = np.zeros((20, 30), dtype=bool)
+    section_mask[5:15, 8:22] = True
+    config = SliceRegistrationConfig(
+        atlas_color=(180, 180, 180),
+        section_color=(255, 96, 96),
+        boundary_color=(0, 255, 0),
+        overlay_alpha=0.5,
+        mask_overlay_to_tissue=True,
+    )
+
+    overlay = slice_registration_module._compose_overlay(
+        warped_section,
+        atlas_reference,
+        atlas_mask,
+        config,
+        section_mask=section_mask,
+    )
+    atlas_gray = slice_registration_module._normalize_uint8(atlas_reference)
+    expected_background = np.asarray(
+        [(1.0 - config.overlay_alpha) * atlas_gray[1, 1] * (channel / 255.0) for channel in config.atlas_color],
+        dtype=np.uint8,
+    )
+
+    assert overlay[1, 1] == pytest.approx(expected_background)
+    assert overlay[10, 15, 0] > overlay[1, 1, 0]
+
+
+def test_display_tissue_mask_is_more_permissive_than_registration_mask():
+    image = np.zeros((40, 60), dtype=np.float32)
+    image[8:32, 10:50] = 20.0
+    image[14:26, 22:38] = 100.0
+    config = SliceRegistrationConfig(
+        tissue_threshold_quantile=0.8,
+        overlay_mask_threshold_quantile=0.3,
+        overlay_mask_dilation_px=0,
+    )
+
+    registration_mask = slice_registration_module._tissue_mask(image, quantile=config.tissue_threshold_quantile)
+    display_mask = slice_registration_module._display_tissue_mask(image, config)
+
+    assert display_mask.sum() > registration_mask.sum()
+    assert display_mask[10, 12]
+    assert not registration_mask[10, 12]
+
+
+def test_slice_registration_loss_penalizes_oversized_warped_masks():
+    section_mask = np.ones((20, 20), dtype=np.float32)
+    atlas_mask = np.zeros((60, 60), dtype=np.float32)
+    atlas_mask[20:40, 20:40] = 1.0
+    config = SliceRegistrationConfig(area_loss_weight=0.2, extent_loss_weight=0.6)
+
+    fit_params = np.array([1.0, 0.0, 29.5, 29.5], dtype=np.float64)
+    oversized_params = np.array([2.0, 0.0, 29.5, 29.5], dtype=np.float64)
+
+    fit_loss = slice_registration_module._registration_loss(fit_params, section_mask, atlas_mask, atlas_mask.shape, config)
+    oversized_loss = slice_registration_module._registration_loss(
+        oversized_params,
+        section_mask,
+        atlas_mask,
+        atlas_mask.shape,
+        config,
+    )
+
+    assert fit_loss < oversized_loss
+
+
+def test_boundary_fit_loss_penalizes_visible_boundary_outside_atlas():
+    section_mask = np.ones((20, 20), dtype=np.float32)
+    boundary_mask = np.ones((28, 28), dtype=np.float32)
+    atlas_mask = np.zeros((60, 60), dtype=np.float32)
+    atlas_mask[16:44, 16:44] = 1.0
+    config = SliceRegistrationConfig(
+        area_loss_weight=0.0,
+        extent_loss_weight=0.0,
+        center_loss_weight=0.0,
+        boundary_fit_weight=0.3,
+        boundary_containment_weight=1.5,
+    )
+
+    contained_params = np.array([1.0, 0.0, 29.5, 29.5], dtype=np.float64)
+    oversized_params = np.array([1.4, 0.0, 29.5, 29.5], dtype=np.float64)
+
+    contained_loss = slice_registration_module._registration_loss(
+        contained_params,
+        section_mask,
+        atlas_mask,
+        atlas_mask.shape,
+        config,
+        section_boundary_mask=boundary_mask,
+    )
+    oversized_loss = slice_registration_module._registration_loss(
+        oversized_params,
+        section_mask,
+        atlas_mask,
+        atlas_mask.shape,
+        config,
+        section_boundary_mask=boundary_mask,
+    )
+
+    assert contained_loss < oversized_loss
+
+
+def test_affine_regularization_penalizes_anisotropy_and_shear():
+    config = SliceRegistrationConfig(
+        max_affine_anisotropy=0.10,
+        max_affine_shear=0.04,
+        affine_regularization_weight=0.08,
+    )
+
+    no_affine = slice_registration_module._affine_regularization_penalty(0.0, 0.0, config)
+    moderate_affine = slice_registration_module._affine_regularization_penalty(0.05, 0.02, config)
+    max_affine = slice_registration_module._affine_regularization_penalty(0.10, 0.04, config)
+
+    assert no_affine == pytest.approx(0.0)
+    assert 0.0 < moderate_affine < max_affine
+
+
+def test_slice_registration_affine_model_reports_bounded_affine_metadata():
+    section_image = np.zeros((60, 80), dtype=np.float32)
+    section_image[14:48, 18:58] = 200.0
+    atlas_reference = np.zeros((60, 80), dtype=np.float32)
+    atlas_reference[12:50, 20:56] = 100.0
+    atlas_mask = np.zeros((60, 80), dtype=bool)
+    atlas_mask[12:50, 20:56] = True
+    config = SliceRegistrationConfig(
+        transform_model="affine",
+        tissue_threshold_quantile=0.5,
+        max_rotation_degrees=0.0,
+        min_scale_factor=0.9,
+        max_scale_factor=1.05,
+        max_affine_anisotropy=0.10,
+        max_affine_shear=0.04,
+        affine_regularization_weight=0.08,
+    )
+
+    _, registration = slice_registration_module._register_section_to_atlas(
+        section_image=section_image,
+        atlas_reference=atlas_reference,
+        atlas_mask=atlas_mask,
+        config=config,
+    )
+
+    assert registration["status"] == "ok"
+    assert registration["transform_model"] == "affine"
+    assert abs(registration["affine_anisotropy"]) <= config.max_affine_anisotropy
+    assert abs(registration["affine_shear"]) <= config.max_affine_shear
+    assert registration["affine_regularization_penalty"] >= 0.0
+    assert registration["scale_y"] > 0.0
+    assert registration["scale_x"] > 0.0
+
+
+def test_slice_registration_respects_zero_rotation_search_bound():
+    section_mask = np.zeros((30, 50), dtype=np.float32)
+    section_mask[5:25, 8:42] = 1.0
+    atlas_mask = np.zeros((40, 60), dtype=np.float32)
+    atlas_mask[10:30, 13:47] = 1.0
+
+    params, _ = slice_registration_module._estimate_similarity_parameters(
+        section_mask_crop=section_mask,
+        section_boundary_mask_crop=section_mask,
+        atlas_mask=atlas_mask,
+        initial=(1.0, 0.0, 20.0, 30.0),
+        config=SliceRegistrationConfig(max_rotation_degrees=0.0),
+    )
+
+    assert np.rad2deg(params[1]) == pytest.approx(0.0)
 
 
 def test_register_slices_to_atlas_handles_empty_masks(tmp_path):
