@@ -24,6 +24,53 @@ metadata, quality control, and post-registration quantification.
 For the current sparse-dataset goal, the primary workflow is now **slice-wise
 atlas superimposition**, not full 3D reconstruction.
 
+## Environment Setup
+
+The recommended day-to-day environment is `histology`, created from
+`environment.yml`:
+
+```powershell
+conda env create -f environment.yml
+conda activate histology
+python -m ipykernel install --user --name histology --display-name "Python (histology)"
+```
+
+This environment uses `conda-forge` plus `nodefaults` and installs the package
+in editable mode with the `atlas` optional dependency group, which includes
+`brainglobe-atlasapi` for sparse slice-wise atlas work. On some conda
+installations, `conda env create -f ...` can still check configured
+`defaults` channels before it finishes reading `nodefaults`. If that happens
+and you see an Anaconda Terms of Service error, either accept the Anaconda ToS
+for the local conda installation or recreate the environment with an explicit
+conda-forge-only command:
+
+```powershell
+conda create -n histology --override-channels -c conda-forge python=3.11 pip ipykernel ipywidgets jupyterlab matplotlib "numpy<2.3" pillow pytest "scikit-image<0.26" "scipy<1.16" tk tifffile xarray
+conda activate histology
+python -m pip install -e ".[atlas]" --no-build-isolation
+python -m ipykernel install --user --name histology --display-name "Python (histology)"
+```
+
+BrainGlobe atlas data are still downloaded separately the first time an atlas
+is requested, for example when constructing
+`BrainGlobeAtlas("whs_sd_rat_39um")`.
+
+Dense 3D `brainreg` execution is intentionally isolated in a second
+environment:
+
+```powershell
+conda env create -f environment-brainreg.yml
+conda activate histology-brainreg
+python -m ipykernel install --user --name histology-brainreg --display-name "Python (histology-brainreg)"
+```
+
+Use `histology-brainreg` only when you are ready to run dense-mode BrainReg
+handoff commands. On Windows, the BrainReg CLI path can involve native
+BrainReg/napari/Qt/NiftyReg components and has previously triggered a
+`python.exe` application error (`0xc06d007f`) during environment verification.
+The current sparse slice-wise workflow does not require launching
+`brainreg.exe`.
+
 ## Planned Workflow
 
 ### 1. Inspect The Raw Slide Data
@@ -425,6 +472,169 @@ slice_result = prepare_slice_atlas_inputs(
 This writes one atlas reference plane and one atlas annotation plane per
 selected section.
 
+If you know only an approximate AP coordinate or atlas index, use the atlas
+index suggester before committing to a slice-atlas manifest:
+
+```python
+from brain_section_pipeline import AtlasIndexSuggestionConfig, suggest_atlas_indices
+
+suggestion_result = suggest_atlas_indices(
+    r"outputs\rat_01\section_manifest.csv",
+    config=AtlasIndexSuggestionConfig(
+        atlas_name="whs_sd_rat_39um",
+        start_ap_mm=-7.30,
+        search_radius_slices=25,
+        top_n=5,
+    ),
+)
+```
+
+This searches a local window of atlas planes for each selected section, runs the
+same constrained 2D registration used by the final overlay stage, ranks the
+candidates, and writes:
+
+- `atlas_index_candidates.csv` with the top candidates and registration metrics;
+- `review_grids/section*_candidate_grid.png` with the top candidates side by
+  side for human review;
+- `selected_atlas_indices.csv` with the machine-selected best atlas index per
+  section;
+- `selected_slice_atlas_manifest.csv`, which can be passed directly to
+  `register_slices_to_atlas`.
+
+The selected candidate is rank 1. The other saved candidates are intended for
+manual review rather than automatic downstream registration.
+
+Atlas-index candidate ranking uses the current boundary-aware registration
+score. In addition to Dice/IoU and center/extent penalties, it penalizes
+candidates whose lower-threshold visible slice boundary is oversized or falls
+outside the atlas mask. The `suggest_atlas_indices.py` script exposes the same
+fit controls as `register_slices_to_atlas.py`, including
+`--translation-initialization`, `--boundary-fit-weight`, and
+`--boundary-containment-weight`, so atlas-plane selection and final overlay
+generation can use matched mechanics.
+
+If the physical spacing between isolated sections is known, use
+`selection_strategy="spacing_locked"` so the first section anchors the series
+and later sections follow the known anatomical interval:
+
+```python
+spacing_result = suggest_atlas_indices(
+    r"outputs\rat_01\section_manifest.csv",
+    config=AtlasIndexSuggestionConfig(
+        atlas_name="whs_sd_rat_39um",
+        start_ap_mm=-7.30,
+        section_interval_um=200.0,
+        direction="posterior",
+        selection_strategy="spacing_locked",
+        search_radius_slices=25,
+        top_n=5,
+    ),
+)
+```
+
+In this mode, the first section still selects the best-scoring candidate within
+the requested search window. Each later section is selected by stepping from
+that first selected atlas index using `section_interval_um` and the atlas
+resolution. Nearby candidates are still stored in the review grids, and the
+selected spacing-locked candidate is highlighted even when it is not the
+highest-scoring local overlay.
+
+If the starting AP estimate may be far from the true first section, use a broad
+first-section anchor search:
+
+```powershell
+python scripts\suggest_atlas_indices.py outputs\rat_01\section_manifest.csv `
+  --atlas whs_sd_rat_39um `
+  --start-ap-mm -7.30 `
+  --section-interval-um 600 `
+  --direction posterior `
+  --selection-strategy spacing_locked `
+  --anchor-search-radius-slices 300 `
+  --anchor-search-stride-slices 10 `
+  --anchor-refine-radius-slices 15 `
+  --min-ap-mm 1.5 `
+  --max-ap-mm 4.0 `
+  --ap-prior-mm 2.75 `
+  --ap-prior-weight 0.05 `
+  --search-radius-slices 5 `
+  --top-n 5
+```
+
+Here `--anchor-search-radius-slices` applies only to the first selected section.
+The normal `--search-radius-slices` still controls the small review window for
+later spacing-derived sections. This matters when the first estimate is only a
+rough guess: in the WHS 39 um atlas, AP `-7.0 mm` and AP `+2.75 mm` are more
+than 250 atlas slices apart. Use `--anchor-search-stride-slices` and
+`--anchor-refine-radius-slices` for a faster coarse-to-fine first-section scan;
+otherwise a broad anchor radius evaluates every atlas plane in the window.
+Use `--min-ap-mm` and `--max-ap-mm` when the section is known to come from a
+plausible AP interval, and `--ap-prior-mm` with `--ap-prior-weight` when you
+want a soft preference near an expected coordinate rather than a hard single
+index.
+
+By default, AP values use the pipeline's existing WHS/native coordinate
+conversion. If you want the command line and CSV outputs to speak a
+Paxinos/Gaidi-style Bregma AP convention while still using `whs_sd_rat_39um`
+for atlas images and masks, set `ap_coordinate_system="paxinos"` or pass
+`--ap-coordinate-system paxinos`. The optional
+`ap_coordinate_offset_mm`/`--ap-coordinate-offset-mm` stores a calibration
+offset between the user-facing Paxinos coordinate and the WHS/native AP
+coordinate:
+
+```text
+whs_native_ap_mm = paxinos_ap_mm + ap_coordinate_offset_mm
+```
+
+Use an offset of `0.0` when you want the Paxinos/Gaidi AP numbers to map
+directly to the current WHS plane convention. If a calibration slice shows that
+the two coordinate references are shifted for a dataset, set the offset
+explicitly and the same conversion will be applied to `--start-ap-mm`,
+`--min-ap-mm`, `--max-ap-mm`, and `--ap-prior-mm`. The candidate and selected
+CSV files record both the configured user-facing AP values and the underlying
+`atlas_native_ap_mm` values used to index the WHS volume.
+
+```powershell
+python scripts\suggest_atlas_indices.py outputs\rat_01\section_manifest.csv `
+  --atlas whs_sd_rat_39um `
+  --ap-coordinate-system paxinos `
+  --ap-coordinate-offset-mm 0.0 `
+  --start-ap-mm 2.75 `
+  --min-ap-mm 1.5 `
+  --max-ap-mm 4.0 `
+  --section-interval-um 600 `
+  --direction posterior `
+  --selection-strategy spacing_locked `
+  --top-n 5
+```
+
+If you do not know the AP interval, enable automatic AP-range estimation:
+
+```powershell
+python scripts\suggest_atlas_indices.py outputs\rat_01\section_manifest.csv `
+  --atlas whs_sd_rat_39um `
+  --start-ap-mm -7.30 `
+  --section-interval-um 600 `
+  --direction posterior `
+  --selection-strategy spacing_locked `
+  --auto-ap-range `
+  --auto-ap-range-stride-slices 10 `
+  --auto-ap-range-top-n 5 `
+  --auto-ap-range-padding-mm 0.75 `
+  --anchor-search-radius-slices 300 `
+  --anchor-search-stride-slices 10 `
+  --anchor-refine-radius-slices 15 `
+  --search-radius-slices 5 `
+  --top-n 5
+```
+
+Automatic AP-range estimation compares the first section's gross tissue
+silhouette to atlas annotation silhouettes and derives a bounded AP interval
+before registration scoring. Treat this as experimental: gross silhouettes can
+look similar across distant AP positions, especially for damaged or partial
+sections. Manual `--min-ap-mm` and `--max-ap-mm` values take precedence when
+supplied and remain the preferred option when you know the approximate
+anatomical region.
+
 Then generate coarse review overlays:
 
 ```python
@@ -449,12 +659,60 @@ python scripts\prepare_slice_atlas.py outputs\rat_01\section_manifest.csv `
   --start-slice-index 80 `
   --slice-index-step 2
 
+python scripts\suggest_atlas_indices.py outputs\rat_01\section_manifest.csv `
+  --atlas whs_sd_rat_39um `
+  --start-ap-mm -7.30 `
+  --section-interval-um 200 `
+  --direction posterior `
+  --selection-strategy spacing_locked `
+  --anchor-search-radius-slices 300 `
+  --anchor-search-stride-slices 10 `
+  --anchor-refine-radius-slices 15 `
+  --search-radius-slices 25 `
+  --top-n 5
+
 python scripts\generate_slice_atlas_qc.py outputs\rat_01\slice_atlas\slice_atlas_manifest.csv
 
 python scripts\register_slices_to_atlas.py outputs\rat_01\slice_atlas\slice_atlas_manifest.csv `
   --max-rotation-degrees 30 `
   --translation-search-fraction 0.2
 ```
+
+When using `suggest_atlas_indices.py`, use its
+`selected_slice_atlas_manifest.csv` as the input to
+`register_slices_to_atlas.py`.
+
+For sparse histology sections where the tissue is not centered inside its crop,
+prefer the default tissue-centroid translation initialization. This maps the
+section tissue centroid to the atlas centroid before the local fit search. The
+overlay PNGs also hide section pixels outside a permissive warped display mask
+by default, which avoids treating rectangular crop background as aligned tissue
+without using the stricter registration mask to fade real brain texture. Tune
+this display-only mask with `--overlay-mask-threshold-quantile` and
+`--overlay-mask-dilation-px`. Use `--translation-initialization crop_center` to
+recover the older crop-center initialization, or `--show-crop-background` when
+you explicitly want to see the full warped crop rectangle.
+
+If the visible slice boundary is consistently larger than the atlas boundary,
+enable or tune the outer-boundary containment term. This uses a lower-threshold
+slice mask to discourage transforms where the visible slice extends beyond the
+selected atlas plane:
+
+```powershell
+python scripts\register_slices_to_atlas.py outputs\rat_01\selected_slice_atlas_manifest.csv `
+  --translation-initialization tissue_centroid `
+  --max-rotation-degrees 1 `
+  --min-scale-factor 0.65 `
+  --max-scale-factor 1.05 `
+  --boundary-fit-threshold-quantile 0.35 `
+  --boundary-fit-weight 0.25 `
+  --boundary-containment-weight 0.9 `
+  --overlay-mask-threshold-quantile 0.35 `
+  --overlay-mask-dilation-px 10
+```
+
+Increase `--boundary-containment-weight` when the visible slice remains too
+large, or decrease it if the slice becomes too small relative to inner anatomy.
 
 For a single-command sparse workflow test, use:
 
@@ -482,9 +740,9 @@ from brain_section_pipeline import SliceRegistrationConfig, register_slices_to_a
 registration_result = register_slices_to_atlas(
     slice_result.manifest_path,
     config=SliceRegistrationConfig(
-        max_rotation_degrees=30.0,
-        min_scale_factor=0.7,
-        max_scale_factor=1.4,
+        max_rotation_degrees=0.0,
+        min_scale_factor=0.8,
+        max_scale_factor=1.0,
     ),
 )
 ```
@@ -499,7 +757,11 @@ The current transform model is slice-wise similarity registration
 (scale/rotation/translation) against the selected 2D atlas plane. That makes
 it a real reusable section-to-atlas alignment stage for sparse workflows, but
 it is still intentionally separate from 3D reconstruction and full atlas-plane
-search.
+search. The default registration now initializes scale from the section and
+atlas mask bounding boxes, keeps rotation fixed at neutral orientation unless
+you opt into a rotation search, and penalizes substantial warped-mask size and
+center mismatches. This makes the final overlays less likely to look oversized,
+off-center, or spuriously rotated for large slide-derived crops.
 
 Once those warped sections exist, the next reusable step is
 `summarize_registered_slices_by_region`.

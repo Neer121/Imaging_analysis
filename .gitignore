@@ -3,6 +3,7 @@
 # Python cache and local notebook state
 __pycache__/
 *.py[cod]
+*.egg-info/
 .ipynb_checkpoints/
 
 # Large raw microscopy data should stay local or use external storage/Git LFS.

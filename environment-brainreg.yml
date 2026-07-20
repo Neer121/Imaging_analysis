@@ -1,4 +1,4 @@
-name: histology
+name: histology-brainreg
 channels:
   - conda-forge
   - nodefaults
@@ -18,4 +18,4 @@ dependencies:
   - tifffile
   - xarray
   - pip:
-      - -e .[atlas]
+      - -e .[brainreg]

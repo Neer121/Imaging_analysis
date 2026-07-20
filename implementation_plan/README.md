@@ -2,3 +2,13 @@
 
 - [2026-06-14 ND2 Brain Section Pipeline](2026-06-14-nd2-brain-section-pipeline.md)
 - [2026-07-08 BrainGlobe Atlas Preparation](2026-07-08-brainglobe-atlas-preparation.md)
+- [2026-07-13 Environment Stabilization](2026-07-13-environment-stabilization.md)
+- [2026-07-14 Slice Registration Overlay Refinement](2026-07-14-slice-registration-overlay-refinement.md)
+- [2026-07-14 Atlas Index Suggestion](2026-07-14-atlas-index-suggestion.md)
+- [2026-07-15 Spacing-Locked Atlas Indexing](2026-07-15-spacing-locked-atlas-indexing.md)
+- [2026-07-16 Paxinos AP Coordinate Convention](2026-07-16-paxinos-ap-coordinate-convention.md)
+- [2026-07-17 Slice Registration Fit Tuning](2026-07-17-slice-registration-fit-tuning.md)
+- [2026-07-17 Large Slide Memory-Safe Export](2026-07-17-large-slide-memory-safe-export.md)
+- [2026-07-17 Landmark And Boundary Atlas Scoring](2026-07-17-landmark-boundary-atlas-scoring.md)
+- [2026-07-17 Constrained Affine Slice Registration](2026-07-17-constrained-affine-registration.md)
+- [2026-07-17 Selected Atlas Preview PNGs](2026-07-17-selected-atlas-preview-pngs.md)
