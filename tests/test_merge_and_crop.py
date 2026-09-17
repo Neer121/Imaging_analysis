@@ -86,6 +86,24 @@ def test_detect_section_crops_finds_and_orders_sections():
     assert crops[1].shape == (90, 130)
 
 
+def test_detection_plane_sanitizes_selected_channel_only(monkeypatch):
+    import brain_section_pipeline.crop as crop_module
+
+    seen_shapes = []
+
+    def fake_sanitize(array, fill_value=0.0):
+        seen_shapes.append(np.asarray(array).shape)
+        return np.asarray(array, dtype=np.float32)
+
+    monkeypatch.setattr(crop_module, "sanitize_array", fake_sanitize)
+
+    image = np.zeros((4, 20, 30), dtype=np.uint16)
+    plane = crop_module._detection_plane(image, mask_channel=2)
+
+    assert plane.shape == (20, 30)
+    assert seen_shapes == [(20, 30)]
+
+
 def test_detect_section_crops_drops_nested_components_after_margin():
     image = np.zeros((1, 220, 260), dtype=np.float32)
     image[0, 20:180, 20:220] = 1.0
@@ -1050,6 +1068,167 @@ def test_suggest_atlas_indices_writes_selected_manifest_and_review_candidates(tm
     assert Path(candidate_rows[0]["overlay_path"]).exists()
 
 
+def test_oblique_atlas_plane_extraction_preserves_zero_angle_slice():
+    volume = np.arange(7 * 9 * 11, dtype=np.float32).reshape((7, 9, 11))
+
+    exact = atlas_indexing_module._extract_slice(volume, 0, 3)
+    zero_angle = atlas_indexing_module._extract_atlas_plane(
+        volume,
+        0,
+        3,
+        pitch_degrees=0.0,
+        yaw_degrees=0.0,
+        resolution_um=(39.0, 39.0, 39.0),
+        order=1,
+    )
+    oblique = atlas_indexing_module._extract_atlas_plane(
+        volume,
+        0,
+        3,
+        pitch_degrees=20.0,
+        yaw_degrees=0.0,
+        resolution_um=(39.0, 39.0, 39.0),
+        order=1,
+    )
+
+    np.testing.assert_array_equal(zero_angle, exact)
+    assert oblique.shape == exact.shape
+    assert not np.allclose(oblique, exact)
+
+
+def test_suggest_atlas_indices_records_oblique_plane_angle_candidates(tmp_path, monkeypatch):
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+
+        def __init__(self):
+            self.reference = np.zeros((7, 40, 50), dtype=np.float32)
+            self.annotation = np.zeros((7, 40, 50), dtype=np.uint16)
+            self.reference[3, 10:30, 14:36] = 120
+            self.annotation[3, 10:30, 14:36] = 1
+
+    monkeypatch.setattr("brain_section_pipeline.atlas_indexing._load_atlas", lambda atlas_name: FakeAtlas())
+
+    section_path = tmp_path / "section001.tif"
+    section = np.zeros((40, 50), dtype=np.float32)
+    section[10:30, 14:36] = 500
+    imwrite(section_path, section)
+
+    manifest_path = tmp_path / "section_manifest.csv"
+    rows = [
+        {
+            "sample_id": "rat_01",
+            "atlas_name": "fake",
+            "source_file": "slide.nd2",
+            "slide_number": "1",
+            "slide_id": "slide",
+            "section_index": "1",
+            "crop_path_rgb": str(section_path),
+            "crop_path_registration": str(section_path),
+            "raw_crop_path": str(section_path),
+            "channel_count": "1",
+            "channel_paths": "{}",
+            "registration_channel": "0",
+            "include_in_stack": "True",
+            "qc_status": "pending",
+        }
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = suggest_atlas_indices(
+        manifest_path,
+        config=AtlasIndexSuggestionConfig(
+            atlas_name="fake",
+            start_slice_index=3,
+            search_radius_slices=0,
+            top_n=2,
+            atlas_plane_angle_search=True,
+            atlas_plane_pitch_degrees=(0.0, 5.0),
+            atlas_plane_yaw_degrees=(0.0,),
+        ),
+    )
+
+    candidate_rows = list(csv.DictReader(result.candidate_manifest_path.open(newline="", encoding="utf-8")))
+    selected_rows = list(csv.DictReader(result.selected_manifest_path.open(newline="", encoding="utf-8")))
+    choices = list(csv.DictReader(result.selected_choices_path.open(newline="", encoding="utf-8")))
+
+    assert len(candidate_rows) == 2
+    assert {float(row["atlas_plane_pitch_degrees"]) for row in candidate_rows} == {0.0, 5.0}
+    assert all(float(row["atlas_plane_yaw_degrees"]) == 0.0 for row in candidate_rows)
+    assert "atlas_plane_pitch_degrees" in selected_rows[0]
+    assert "selected_atlas_plane_pitch_degrees" in choices[0]
+    assert "pitch" in Path(candidate_rows[0]["overlay_path"]).name
+
+
+def test_suggest_atlas_indices_supports_independent_coarse_to_fine_search(tmp_path, monkeypatch):
+    class FakeAtlas:
+        orientation = "asr"
+        resolution = (39.0, 39.0, 39.0)
+
+        def __init__(self):
+            self.reference = np.zeros((11, 40, 50), dtype=np.float32)
+            self.annotation = np.zeros((11, 40, 50), dtype=np.uint16)
+            self.reference[4, 12:28, 18:32] = 80
+            self.annotation[4, 12:28, 18:32] = 1
+            self.reference[8, 10:30, 14:36] = 120
+            self.annotation[8, 10:30, 14:36] = 1
+
+    monkeypatch.setattr("brain_section_pipeline.atlas_indexing._load_atlas", lambda atlas_name: FakeAtlas())
+
+    section_path = tmp_path / "section001.tif"
+    section = np.zeros((40, 50), dtype=np.float32)
+    section[10:30, 14:36] = 500
+    imwrite(section_path, section)
+
+    manifest_path = tmp_path / "section_manifest.csv"
+    rows = [
+        {
+            "sample_id": "rat_01",
+            "atlas_name": "fake",
+            "source_file": "slide.nd2",
+            "slide_number": "1",
+            "slide_id": "slide",
+            "section_index": "1",
+            "crop_path_rgb": str(section_path),
+            "crop_path_registration": str(section_path),
+            "raw_crop_path": str(section_path),
+            "channel_count": "1",
+            "channel_paths": "{}",
+            "registration_channel": "0",
+            "include_in_stack": "True",
+            "qc_status": "pending",
+        }
+    ]
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = suggest_atlas_indices(
+        manifest_path,
+        config=AtlasIndexSuggestionConfig(
+            atlas_name="fake",
+            start_slice_index=5,
+            search_radius_slices=5,
+            search_stride_slices=4,
+            search_refine_radius_slices=1,
+            top_n=3,
+        ),
+    )
+
+    selected_rows = list(csv.DictReader(result.selected_manifest_path.open(newline="", encoding="utf-8")))
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert selected_rows[0]["atlas_slice_index"]
+    assert Path(selected_rows[0]["atlas_reference_path"]).exists()
+    assert Path(selected_rows[0]["atlas_annotation_path"]).exists()
+    assert metadata["config"]["search_stride_slices"] == 4
+    assert metadata["config"]["search_refine_radius_slices"] == 1
+
+
 def test_export_selected_atlas_previews_from_existing_selected_manifest(tmp_path):
     reference_path = tmp_path / "atlas_reference.tif"
     annotation_path = tmp_path / "atlas_annotation.tif"
@@ -1704,6 +1883,37 @@ def test_slice_registration_affine_model_reports_bounded_affine_metadata():
     assert registration["affine_regularization_penalty"] >= 0.0
     assert registration["scale_y"] > 0.0
     assert registration["scale_x"] > 0.0
+
+
+def test_boundary_spline_refinement_reduces_shifted_boundary_distance():
+    atlas_mask = np.zeros((80, 90), dtype=bool)
+    atlas_mask[24:56, 28:62] = True
+    shifted_mask = np.zeros_like(atlas_mask)
+    shifted_mask[27:59, 32:66] = True
+    config = SliceRegistrationConfig(
+        nonlinear_refinement_model="boundary_spline",
+        nonlinear_max_displacement_px=6.0,
+        nonlinear_control_point_spacing_px=8.0,
+        nonlinear_iterations=1,
+        nonlinear_boundary_sample_step=1,
+    )
+
+    before = slice_registration_module._boundary_distance_metric_value(shifted_mask, atlas_mask)
+    _, refined_mask, _, refined_boundary, metadata = slice_registration_module._apply_boundary_spline_refinement(
+        warped_section=shifted_mask.astype(np.float32),
+        warped_mask=shifted_mask,
+        warped_display_mask=shifted_mask,
+        warped_boundary_mask=shifted_mask,
+        atlas_mask=atlas_mask,
+        config=config,
+    )
+    after = slice_registration_module._boundary_distance_metric_value(refined_boundary, atlas_mask)
+
+    assert metadata["nonlinear_refinement_model"] == "boundary_spline"
+    assert metadata["nonlinear_iterations_completed"] == 1
+    assert 0.0 < metadata["nonlinear_max_displacement_px"] <= config.nonlinear_max_displacement_px
+    assert refined_mask.shape == atlas_mask.shape
+    assert after < before
 
 
 def test_slice_registration_respects_zero_rotation_search_bound():

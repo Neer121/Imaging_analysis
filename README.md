@@ -635,6 +635,24 @@ sections. Manual `--min-ap-mm` and `--max-ap-mm` values take precedence when
 supplied and remain the preferred option when you know the approximate
 anatomical region.
 
+If the tissue may have been cut slightly obliquely, enable atlas plane-angle
+search during atlas-index suggestion. This keeps the current AP search but
+tests each AP candidate against small pitch/yaw variants sampled from the 3D
+atlas volume. Candidate grids, selected manifests, and atlas preview PNG titles
+record the selected angles:
+
+```powershell
+python scripts\suggest_atlas_indices.py outputs\rat_01\section_manifest.csv `
+  --atlas whs_sd_rat_39um `
+  --start-ap-mm -0.80 `
+  --min-ap-mm -0.90 `
+  --max-ap-mm -0.70 `
+  --atlas-plane-angle-search `
+  --atlas-plane-pitch-degrees -6,-3,0,3,6 `
+  --atlas-plane-yaw-degrees -4,0,4 `
+  --top-n 5
+```
+
 Then generate coarse review overlays:
 
 ```python
@@ -714,6 +732,23 @@ python scripts\register_slices_to_atlas.py outputs\rat_01\selected_slice_atlas_m
 Increase `--boundary-containment-weight` when the visible slice remains too
 large, or decrease it if the slice becomes too small relative to inner anatomy.
 
+For review overlays that still have small local boundary mismatches after the
+global fit, optionally add a conservative boundary-spline refinement. This runs
+after the similarity/affine transform, saves the affine-before overlay in
+`affine_overlays/`, and records displacement metrics in the registration CSV:
+
+```powershell
+python scripts\register_slices_to_atlas.py outputs\rat_01\selected_slice_atlas_manifest.csv `
+  --transform-model affine `
+  --nonlinear-refinement-model boundary_spline `
+  --nonlinear-max-displacement-px 6 `
+  --nonlinear-control-point-spacing-px 48 `
+  --nonlinear-iterations 2
+```
+
+Keep this optional and review-driven: it is intended to tidy residual overlay
+fit, not to replace correct atlas index and plane selection.
+
 For a single-command sparse workflow test, use:
 
 ```powershell
@@ -753,15 +788,16 @@ This stage writes:
 - a registration overlay for visual review;
 - a registration manifest with transform parameters and overlap metrics.
 
-The current transform model is slice-wise similarity registration
-(scale/rotation/translation) against the selected 2D atlas plane. That makes
-it a real reusable section-to-atlas alignment stage for sparse workflows, but
-it is still intentionally separate from 3D reconstruction and full atlas-plane
-search. The default registration now initializes scale from the section and
-atlas mask bounding boxes, keeps rotation fixed at neutral orientation unless
-you opt into a rotation search, and penalizes substantial warped-mask size and
-center mismatches. This makes the final overlays less likely to look oversized,
-off-center, or spuriously rotated for large slide-derived crops.
+The default transform model is slice-wise similarity registration
+(scale/rotation/translation) against the selected 2D atlas plane, with an
+optional constrained affine refinement. That makes it a real reusable
+section-to-atlas alignment stage for sparse workflows, but it is still
+intentionally separate from 3D reconstruction. The default registration now
+initializes scale from the section and atlas mask bounding boxes, keeps rotation
+fixed at neutral orientation unless you opt into a rotation search, and
+penalizes substantial warped-mask size and center mismatches. This makes the
+final overlays less likely to look oversized, off-center, or spuriously rotated
+for large slide-derived crops.
 
 Once those warped sections exist, the next reusable step is
 `summarize_registered_slices_by_region`.

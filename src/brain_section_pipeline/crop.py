@@ -189,19 +189,19 @@ def sort_crop_boxes(
 
 
 def _detection_plane(image: np.ndarray, *, mask_channel: int | None) -> np.ndarray:
-    array = sanitize_array(image)
+    array = np.asarray(image)
     if array.ndim == 2:
-        return array
+        return sanitize_array(array)
     if array.ndim != 3:
         raise ValueError("Detection image must be 2D, RGB, or channel-first.")
     if array.shape[-1] in (3, 4):
         if mask_channel is None:
-            return array[..., :3].max(axis=-1)
-        return array[..., mask_channel]
+            return sanitize_array(array[..., :3].max(axis=-1))
+        return sanitize_array(array[..., mask_channel])
     if array.shape[0] <= 8:
         if mask_channel is None:
-            return array.max(axis=0)
-        return array[mask_channel]
+            return sanitize_array(array.max(axis=0))
+        return sanitize_array(array[mask_channel])
     raise ValueError("Could not infer detection image layout.")
 
 

@@ -17,6 +17,7 @@ from tifffile import imread, imwrite
 ScaleInitialization = Literal["bbox_fit", "area"]
 TranslationInitialization = Literal["crop_center", "tissue_centroid"]
 TransformModel = Literal["similarity", "affine"]
+NonlinearRefinementModel = Literal["none", "boundary_spline"]
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,11 @@ class SliceRegistrationConfig:
     boundary_fit_dilation_px: int = 0
     boundary_fit_weight: float = 0.35
     boundary_containment_weight: float = 1.2
+    nonlinear_refinement_model: NonlinearRefinementModel = "none"
+    nonlinear_max_displacement_px: float = 8.0
+    nonlinear_control_point_spacing_px: float = 48.0
+    nonlinear_iterations: int = 2
+    nonlinear_boundary_sample_step: int = 3
     output_name: str = "slice_registration_manifest.csv"
     metadata_name: str = "slice_registration_metadata.json"
 
@@ -91,8 +97,11 @@ def register_slices_to_atlas(
     registration_dir = Path(output_dir) if output_dir is not None else manifest.parent / "slice_registration"
     warped_sections_dir = registration_dir / "warped_sections"
     overlay_dir = registration_dir / "overlays"
+    affine_overlay_dir = registration_dir / "affine_overlays"
     warped_sections_dir.mkdir(parents=True, exist_ok=True)
     overlay_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.nonlinear_refinement_model != "none":
+        affine_overlay_dir.mkdir(parents=True, exist_ok=True)
 
     output_rows: list[dict[str, Any]] = []
     section_indices: list[int] = []
@@ -112,18 +121,33 @@ def register_slices_to_atlas(
         )
         registration.pop("_warped_mask", None)
         warped_display_mask = registration.pop("_warped_display_mask", None)
+        affine_warped_section = registration.pop("_affine_warped_section", None)
+        affine_warped_display_mask = registration.pop("_affine_warped_display_mask", None)
         overlay = _compose_overlay(warped_section, atlas_reference, atlas_mask, cfg, section_mask=warped_display_mask)
 
         warped_path = warped_sections_dir / f"section{section_index:03d}_warped.tif"
         overlay_path = overlay_dir / f"section{section_index:03d}_overlay.png"
         imwrite(warped_path, warped_section.astype(np.float32))
         Image.fromarray(overlay, mode="RGB").save(overlay_path)
+        affine_overlay_path = ""
+        if affine_warped_section is not None:
+            affine_overlay = _compose_overlay(
+                affine_warped_section,
+                atlas_reference,
+                atlas_mask,
+                cfg,
+                section_mask=affine_warped_display_mask,
+            )
+            affine_overlay_path_obj = affine_overlay_dir / f"section{section_index:03d}_affine_overlay.png"
+            Image.fromarray(affine_overlay, mode="RGB").save(affine_overlay_path_obj)
+            affine_overlay_path = str(affine_overlay_path_obj)
 
         output_rows.append(
             {
                 **row,
                 "warped_section_path": str(warped_path),
                 "registration_overlay_path": str(overlay_path),
+                "registration_affine_overlay_path": affine_overlay_path,
                 "registration_status": registration["status"],
                 "registration_loss": registration["loss"],
                 "registration_dice": registration["dice"],
@@ -147,6 +171,11 @@ def register_slices_to_atlas(
                 "registration_boundary_extent_y_ratio": registration["boundary_extent_y_ratio"],
                 "registration_boundary_extent_x_ratio": registration["boundary_extent_x_ratio"],
                 "registration_boundary_outside_fraction": registration["boundary_outside_fraction"],
+                "registration_affine_boundary_distance_norm": registration["affine_boundary_distance_norm"],
+                "registration_nonlinear_refinement_model": registration["nonlinear_refinement_model"],
+                "registration_nonlinear_iterations_completed": registration["nonlinear_iterations_completed"],
+                "registration_nonlinear_max_displacement_px": registration["nonlinear_max_displacement_px"],
+                "registration_nonlinear_mean_displacement_px": registration["nonlinear_mean_displacement_px"],
                 "registration_matrix": json.dumps(registration["matrix"]),
             }
         )
@@ -185,6 +214,11 @@ def register_slices_to_atlas(
                     "registration_boundary_extent_y_ratio": float(row["registration_boundary_extent_y_ratio"]),
                     "registration_boundary_extent_x_ratio": float(row["registration_boundary_extent_x_ratio"]),
                     "registration_boundary_outside_fraction": float(row["registration_boundary_outside_fraction"]),
+                    "registration_affine_boundary_distance_norm": float(row["registration_affine_boundary_distance_norm"]),
+                    "registration_nonlinear_refinement_model": row["registration_nonlinear_refinement_model"],
+                    "registration_nonlinear_iterations_completed": int(row["registration_nonlinear_iterations_completed"]),
+                    "registration_nonlinear_max_displacement_px": float(row["registration_nonlinear_max_displacement_px"]),
+                    "registration_nonlinear_mean_displacement_px": float(row["registration_nonlinear_mean_displacement_px"]),
                 }
                 for row in output_rows
             ],
@@ -276,16 +310,44 @@ def _register_prepared_section_to_atlas(
     elif config.transform_model != "similarity":
         raise ValueError("transform_model must be one of: 'similarity', 'affine'.")
 
-    warped_section = _warp_image(section_crop, transform_matrix, atlas_shape, order=1, fill_value=config.fill_value)
-    warped_mask = _warp_image(section_mask_crop.astype(np.float32), transform_matrix, atlas_shape, order=1, fill_value=0.0) >= 0.5
-    warped_display_mask = (
+    affine_warped_section = _warp_image(section_crop, transform_matrix, atlas_shape, order=1, fill_value=config.fill_value)
+    affine_warped_mask = (
+        _warp_image(section_mask_crop.astype(np.float32), transform_matrix, atlas_shape, order=1, fill_value=0.0) >= 0.5
+    )
+    affine_warped_display_mask = (
         _warp_image(section_display_mask_crop.astype(np.float32), transform_matrix, atlas_shape, order=0, fill_value=0.0)
         >= 0.5
     )
-    warped_boundary_mask = (
+    affine_warped_boundary_mask = (
         _warp_image(section_boundary_mask_crop.astype(np.float32), transform_matrix, atlas_shape, order=0, fill_value=0.0)
         >= 0.5
     )
+    affine_boundary_metrics = _boundary_fit_metrics(affine_warped_boundary_mask, atlas_mask)
+    affine_boundary_distance = _boundary_distance_metric_value(affine_warped_boundary_mask, atlas_mask)
+
+    warped_section = affine_warped_section
+    warped_mask = affine_warped_mask
+    warped_display_mask = affine_warped_display_mask
+    warped_boundary_mask = affine_warped_boundary_mask
+    nonlinear_metadata = _empty_nonlinear_refinement_metadata(config)
+    if config.nonlinear_refinement_model == "boundary_spline":
+        (
+            warped_section,
+            warped_mask,
+            warped_display_mask,
+            warped_boundary_mask,
+            nonlinear_metadata,
+        ) = _apply_boundary_spline_refinement(
+            warped_section=affine_warped_section,
+            warped_mask=affine_warped_mask,
+            warped_display_mask=affine_warped_display_mask,
+            warped_boundary_mask=affine_warped_boundary_mask,
+            atlas_mask=atlas_mask,
+            config=config,
+        )
+    elif config.nonlinear_refinement_model != "none":
+        raise ValueError("nonlinear_refinement_model must be one of: 'none', 'boundary_spline'.")
+
     dice, iou = _overlap_metrics(warped_mask, atlas_mask)
     shape_metrics = _shape_metrics(warped_mask, atlas_mask)
     boundary_metrics = _boundary_fit_metrics(warped_boundary_mask, atlas_mask)
@@ -300,6 +362,14 @@ def _register_prepared_section_to_atlas(
         "_warped_mask": warped_mask,
         "_warped_display_mask": warped_display_mask,
         "_warped_boundary_mask": warped_boundary_mask,
+        "_affine_warped_section": affine_warped_section if config.nonlinear_refinement_model != "none" else None,
+        "_affine_warped_display_mask": affine_warped_display_mask if config.nonlinear_refinement_model != "none" else None,
+        "affine_boundary_area_ratio": affine_boundary_metrics["boundary_area_ratio"],
+        "affine_boundary_extent_y_ratio": affine_boundary_metrics["boundary_extent_y_ratio"],
+        "affine_boundary_extent_x_ratio": affine_boundary_metrics["boundary_extent_x_ratio"],
+        "affine_boundary_outside_fraction": affine_boundary_metrics["boundary_outside_fraction"],
+        "affine_boundary_distance_norm": affine_boundary_distance,
+        **nonlinear_metadata,
         **shape_metrics,
         **boundary_metrics,
     }
@@ -868,6 +938,182 @@ def _boundary_fit_loss_penalty(
     return float(config.boundary_fit_weight * boundary_mismatch + config.boundary_containment_weight * containment)
 
 
+def _apply_boundary_spline_refinement(
+    *,
+    warped_section: np.ndarray,
+    warped_mask: np.ndarray,
+    warped_display_mask: np.ndarray,
+    warped_boundary_mask: np.ndarray,
+    atlas_mask: np.ndarray,
+    config: SliceRegistrationConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    max_total_displacement = max(0.0, float(config.nonlinear_max_displacement_px))
+    iterations = max(0, int(config.nonlinear_iterations))
+    if max_total_displacement <= 0.0 or iterations <= 0:
+        return (
+            warped_section,
+            warped_mask,
+            warped_display_mask,
+            warped_boundary_mask,
+            _empty_nonlinear_refinement_metadata(config),
+        )
+
+    refined_section = np.asarray(warped_section, dtype=np.float32)
+    refined_mask = np.asarray(warped_mask, dtype=bool)
+    refined_display_mask = np.asarray(warped_display_mask, dtype=bool)
+    refined_boundary_mask = np.asarray(warped_boundary_mask, dtype=bool)
+    cumulative_dy = np.zeros(refined_section.shape, dtype=np.float32)
+    cumulative_dx = np.zeros(refined_section.shape, dtype=np.float32)
+    per_iteration_limit = max_total_displacement / max(1, iterations)
+    completed = 0
+
+    for _ in range(iterations):
+        dy, dx = _boundary_displacement_field(
+            refined_boundary_mask,
+            atlas_mask,
+            max_displacement_px=per_iteration_limit,
+            control_point_spacing_px=config.nonlinear_control_point_spacing_px,
+            sample_step=config.nonlinear_boundary_sample_step,
+        )
+        magnitude = np.sqrt(dy * dy + dx * dx)
+        if not np.isfinite(magnitude).any() or float(magnitude.max(initial=0.0)) <= 1e-6:
+            break
+
+        refined_section = _warp_atlas_space_with_displacement(
+            refined_section,
+            dy,
+            dx,
+            order=1,
+            fill_value=config.fill_value,
+        )
+        refined_mask = (
+            _warp_atlas_space_with_displacement(refined_mask.astype(np.float32), dy, dx, order=0, fill_value=0.0) >= 0.5
+        )
+        refined_display_mask = (
+            _warp_atlas_space_with_displacement(
+                refined_display_mask.astype(np.float32),
+                dy,
+                dx,
+                order=0,
+                fill_value=0.0,
+            )
+            >= 0.5
+        )
+        refined_boundary_mask = (
+            _warp_atlas_space_with_displacement(
+                refined_boundary_mask.astype(np.float32),
+                dy,
+                dx,
+                order=0,
+                fill_value=0.0,
+            )
+            >= 0.5
+        )
+        cumulative_dy += dy
+        cumulative_dx += dx
+        completed += 1
+
+    displacement = np.sqrt(cumulative_dy * cumulative_dy + cumulative_dx * cumulative_dx)
+    active = displacement > 1e-6
+    mean_displacement = float(displacement[active].mean()) if np.any(active) else 0.0
+    max_displacement = float(displacement.max(initial=0.0))
+    return (
+        refined_section,
+        refined_mask,
+        refined_display_mask,
+        refined_boundary_mask,
+        {
+            "nonlinear_refinement_model": config.nonlinear_refinement_model,
+            "nonlinear_iterations_completed": int(completed),
+            "nonlinear_max_displacement_px": max_displacement,
+            "nonlinear_mean_displacement_px": mean_displacement,
+        },
+    )
+
+
+def _boundary_displacement_field(
+    section_boundary_mask: np.ndarray,
+    atlas_mask: np.ndarray,
+    *,
+    max_displacement_px: float,
+    control_point_spacing_px: float,
+    sample_step: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    section_boundary = _boundary_mask(np.asarray(section_boundary_mask, dtype=bool))
+    atlas_boundary = _boundary_mask(np.asarray(atlas_mask, dtype=bool))
+    if not np.any(section_boundary) or not np.any(atlas_boundary):
+        shape = np.asarray(atlas_mask).shape
+        return np.zeros(shape, dtype=np.float32), np.zeros(shape, dtype=np.float32)
+
+    sample_mask = section_boundary.copy()
+    step = max(1, int(sample_step))
+    if step > 1:
+        yy, xx = _target_grid(section_boundary.shape[0], section_boundary.shape[1])
+        sample_mask &= (np.rint(yy).astype(np.intp) % step == 0) & (np.rint(xx).astype(np.intp) % step == 0)
+        if not np.any(sample_mask):
+            sample_mask = section_boundary
+
+    _, nearest_indices = ndimage.distance_transform_edt(np.logical_not(atlas_boundary), return_indices=True)
+    source_y, source_x = np.nonzero(sample_mask)
+    target_y = nearest_indices[0, source_y, source_x].astype(np.float32)
+    target_x = nearest_indices[1, source_y, source_x].astype(np.float32)
+    dy_values = target_y - source_y.astype(np.float32)
+    dx_values = target_x - source_x.astype(np.float32)
+    dy_values, dx_values = _clip_displacement_vectors(dy_values, dx_values, max_displacement_px=max_displacement_px)
+
+    shape = section_boundary.shape
+    sparse_dy = np.zeros(shape, dtype=np.float32)
+    sparse_dx = np.zeros(shape, dtype=np.float32)
+    weights = np.zeros(shape, dtype=np.float32)
+    sparse_dy[source_y, source_x] = dy_values
+    sparse_dx[source_y, source_x] = dx_values
+    weights[source_y, source_x] = 1.0
+
+    sigma = max(1.0, float(control_point_spacing_px) / 2.0)
+    smooth_weights = ndimage.gaussian_filter(weights, sigma=sigma, mode="nearest")
+    smooth_dy = ndimage.gaussian_filter(sparse_dy, sigma=sigma, mode="nearest")
+    smooth_dx = ndimage.gaussian_filter(sparse_dx, sigma=sigma, mode="nearest")
+    valid = smooth_weights > 1e-6
+    dy = np.zeros(shape, dtype=np.float32)
+    dx = np.zeros(shape, dtype=np.float32)
+    dy[valid] = smooth_dy[valid] / smooth_weights[valid]
+    dx[valid] = smooth_dx[valid] / smooth_weights[valid]
+    dy, dx = _clip_displacement_vectors(dy, dx, max_displacement_px=max_displacement_px)
+    return dy.astype(np.float32), dx.astype(np.float32)
+
+
+def _clip_displacement_vectors(
+    dy: np.ndarray,
+    dx: np.ndarray,
+    *,
+    max_displacement_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    limit = max(0.0, float(max_displacement_px))
+    dy_array = np.asarray(dy, dtype=np.float32)
+    dx_array = np.asarray(dx, dtype=np.float32)
+    if limit <= 0.0:
+        return np.zeros_like(dy_array), np.zeros_like(dx_array)
+    magnitude = np.sqrt(dy_array * dy_array + dx_array * dx_array)
+    scale = np.ones_like(magnitude, dtype=np.float32)
+    large = magnitude > limit
+    scale[large] = limit / np.maximum(magnitude[large], 1e-6)
+    return dy_array * scale, dx_array * scale
+
+
+def _warp_atlas_space_with_displacement(
+    image: np.ndarray,
+    dy: np.ndarray,
+    dx: np.ndarray,
+    *,
+    order: int,
+    fill_value: float,
+) -> np.ndarray:
+    yy, xx = _target_grid(dy.shape[0], dy.shape[1])
+    source_y = yy - np.asarray(dy, dtype=np.float32)
+    source_x = xx - np.asarray(dx, dtype=np.float32)
+    return _sample_image(np.asarray(image, dtype=np.float32), source_y, source_x, order=order, fill_value=fill_value)
+
+
 def _similarity_matrix(
     scale: float,
     rotation_radians: float,
@@ -1208,6 +1454,31 @@ def _boundary_fit_metrics(boundary_mask: np.ndarray, atlas_mask: np.ndarray) -> 
     }
 
 
+def _boundary_distance_metric_value(boundary_mask: np.ndarray, atlas_mask: np.ndarray) -> float:
+    boundary = _boundary_mask(np.asarray(boundary_mask, dtype=bool))
+    atlas_boundary = _boundary_mask(np.asarray(atlas_mask, dtype=bool))
+    if not np.any(boundary) or not np.any(atlas_boundary):
+        return 1.0
+    distance_to_atlas = ndimage.distance_transform_edt(np.logical_not(atlas_boundary))
+    atlas_bbox = _bbox(np.asarray(atlas_mask, dtype=bool))
+    if atlas_bbox is None:
+        normalizer = float(max(atlas_mask.shape))
+    else:
+        atlas_height = max(1.0, float(atlas_bbox[1] - atlas_bbox[0]))
+        atlas_width = max(1.0, float(atlas_bbox[3] - atlas_bbox[2]))
+        normalizer = float(np.hypot(atlas_height, atlas_width))
+    return min(1.0, float(np.mean(distance_to_atlas[boundary])) / max(1.0, normalizer))
+
+
+def _empty_nonlinear_refinement_metadata(config: SliceRegistrationConfig) -> dict[str, Any]:
+    return {
+        "nonlinear_refinement_model": config.nonlinear_refinement_model,
+        "nonlinear_iterations_completed": 0,
+        "nonlinear_max_displacement_px": 0.0,
+        "nonlinear_mean_displacement_px": 0.0,
+    }
+
+
 def _empty_registration() -> dict[str, Any]:
     return {
         "status": "empty_mask",
@@ -1238,6 +1509,15 @@ def _empty_registration() -> dict[str, Any]:
         "dorsal_midline_distance": 1.0,
         "dorsal_midline_y_offset": 0.0,
         "dorsal_midline_x_offset": 0.0,
+        "affine_boundary_area_ratio": 0.0,
+        "affine_boundary_extent_y_ratio": 0.0,
+        "affine_boundary_extent_x_ratio": 0.0,
+        "affine_boundary_outside_fraction": 0.0,
+        "affine_boundary_distance_norm": 1.0,
+        "nonlinear_refinement_model": "none",
+        "nonlinear_iterations_completed": 0,
+        "nonlinear_max_displacement_px": 0.0,
+        "nonlinear_mean_displacement_px": 0.0,
     }
 
 

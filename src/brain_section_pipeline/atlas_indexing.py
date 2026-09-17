@@ -53,6 +53,8 @@ class AtlasIndexSuggestionConfig:
     direction: DirectionName = "posterior"
     selection_strategy: SelectionStrategy = "best_score"
     search_radius_slices: int = 25
+    search_stride_slices: int = 1
+    search_refine_radius_slices: int | None = None
     anchor_search_radius_slices: int | None = None
     anchor_search_stride_slices: int = 1
     anchor_refine_radius_slices: int | None = None
@@ -69,6 +71,9 @@ class AtlasIndexSuggestionConfig:
     top_n: int = 5
     boundary_distance_weight: float = 0.35
     dorsal_midline_weight: float = 0.45
+    atlas_plane_angle_search: bool = False
+    atlas_plane_pitch_degrees: tuple[float, ...] = (0.0,)
+    atlas_plane_yaw_degrees: tuple[float, ...] = (0.0,)
     registration_config: SliceRegistrationConfig = field(default_factory=SliceRegistrationConfig)
     output_name: str = "atlas_index_suggestions"
     candidate_manifest_name: str = "atlas_index_candidates.csv"
@@ -248,15 +253,23 @@ def suggest_atlas_indices(
 
         selected = _select_candidate(ranked, forced_selected_index)
         selected_index = int(selected["atlas_slice_index"])
+        selected_identity = _candidate_identity(selected)
         top_candidates = _review_candidates(ranked, top_n=cfg.top_n, forced_index=selected_index)
         for candidate in top_candidates:
-            candidate["is_selected_candidate"] = int(candidate["atlas_slice_index"]) == selected_index
+            candidate["is_selected_candidate"] = _candidate_identity(candidate) == selected_identity
 
         overlay_paths: list[Path] = []
         for review_rank, candidate in enumerate(top_candidates, start=1):
-            is_selected = int(candidate["atlas_slice_index"]) == selected_index
+            is_selected = _candidate_identity(candidate) == selected_identity
             atlas_slice_index = int(candidate["atlas_slice_index"])
-            overlay_path = section_candidate_dir / f"rank{review_rank:02d}_index{atlas_slice_index:04d}_overlay.png"
+            angle_label = _angle_label_for_filename(
+                float(candidate.get("atlas_plane_pitch_degrees", 0.0)),
+                float(candidate.get("atlas_plane_yaw_degrees", 0.0)),
+            )
+            overlay_path = (
+                section_candidate_dir
+                / f"rank{review_rank:02d}_index{atlas_slice_index:04d}_{angle_label}_overlay.png"
+            )
             Image.fromarray(candidate["overlay"], mode="RGB").save(overlay_path)
             overlay_paths.append(overlay_path)
 
@@ -288,7 +301,11 @@ def suggest_atlas_indices(
         selected_overlay_path = selected_overlay_dir / f"section{section_index:03d}_selected_overlay.png"
         selected_atlas_preview_path = (
             selected_atlas_preview_dir
-            / f"section{section_index:03d}_atlas_index{selected_index:04d}_ap{_ap_label_for_filename(selected['atlas_ap_mm'])}.png"
+            / (
+                f"section{section_index:03d}_atlas_index{selected_index:04d}_"
+                f"ap{_ap_label_for_filename(selected['atlas_ap_mm'])}_"
+                f"{_angle_label_for_filename(float(selected.get('atlas_plane_pitch_degrees', 0.0)), float(selected.get('atlas_plane_yaw_degrees', 0.0)))}.png"
+            )
         )
         imwrite(selected_reference_path, selected["reference_slice"])
         imwrite(selected_annotation_path, selected["annotation_slice"])
@@ -304,6 +321,8 @@ def suggest_atlas_indices(
                 atlas_ap_mm=float(selected["atlas_ap_mm"]),
                 atlas_native_ap_mm=float(selected["atlas_native_ap_mm"]),
                 ap_coordinate_system=cfg.ap_coordinate_system,
+                atlas_plane_pitch_degrees=float(selected.get("atlas_plane_pitch_degrees", 0.0)),
+                atlas_plane_yaw_degrees=float(selected.get("atlas_plane_yaw_degrees", 0.0)),
             ),
         )
         atlas_preview_paths.append(selected_atlas_preview_path)
@@ -320,6 +339,8 @@ def suggest_atlas_indices(
                 "atlas_slice_index": selected_index,
                 "atlas_ap_mm": selected["atlas_ap_mm"],
                 "atlas_native_ap_mm": selected["atlas_native_ap_mm"],
+                "atlas_plane_pitch_degrees": selected.get("atlas_plane_pitch_degrees", 0.0),
+                "atlas_plane_yaw_degrees": selected.get("atlas_plane_yaw_degrees", 0.0),
                 "atlas_reference_path": str(selected_reference_path),
                 "atlas_annotation_path": str(selected_annotation_path),
                 "section_source_kind": cfg.section_source,
@@ -341,6 +362,8 @@ def suggest_atlas_indices(
                 "selected_atlas_slice_index": selected_index,
                 "selected_ap_mm": selected["atlas_ap_mm"],
                 "selected_native_ap_mm": selected["atlas_native_ap_mm"],
+                "selected_atlas_plane_pitch_degrees": selected.get("atlas_plane_pitch_degrees", 0.0),
+                "selected_atlas_plane_yaw_degrees": selected.get("atlas_plane_yaw_degrees", 0.0),
                 "expected_atlas_slice_index": expected_index,
                 "expected_ap_mm": expected_ap_mm,
                 "expected_native_ap_mm": expected_atlas_native_ap_mm,
@@ -431,9 +454,14 @@ def export_selected_atlas_previews(
         atlas_slice_index = int(row["atlas_slice_index"])
         atlas_ap_mm = float(row["atlas_ap_mm"])
         atlas_native_ap_mm = float(row.get("atlas_native_ap_mm", atlas_ap_mm))
+        pitch_degrees = float(row.get("atlas_plane_pitch_degrees", 0.0) or 0.0)
+        yaw_degrees = float(row.get("atlas_plane_yaw_degrees", 0.0) or 0.0)
         preview_path = (
             preview_dir
-            / f"section{section_index:03d}_atlas_index{atlas_slice_index:04d}_ap{_ap_label_for_filename(atlas_ap_mm)}.png"
+            / (
+                f"section{section_index:03d}_atlas_index{atlas_slice_index:04d}_"
+                f"ap{_ap_label_for_filename(atlas_ap_mm)}_{_angle_label_for_filename(pitch_degrees, yaw_degrees)}.png"
+            )
         )
         reference = np.asarray(imread(row["atlas_reference_path"]))
         annotation = np.asarray(imread(row["atlas_annotation_path"]))
@@ -447,6 +475,8 @@ def export_selected_atlas_previews(
                 atlas_ap_mm=atlas_ap_mm,
                 atlas_native_ap_mm=atlas_native_ap_mm,
                 ap_coordinate_system=row.get("ap_coordinate_system", "atlas"),
+                atlas_plane_pitch_degrees=pitch_degrees,
+                atlas_plane_yaw_degrees=yaw_degrees,
             ),
         )
         preview_paths.append(preview_path)
@@ -592,6 +622,8 @@ def _candidate_manifest_row(
         "atlas_slice_index": int(candidate["atlas_slice_index"]),
         "atlas_ap_mm": candidate["atlas_ap_mm"],
         "atlas_native_ap_mm": candidate["atlas_native_ap_mm"],
+        "atlas_plane_pitch_degrees": candidate.get("atlas_plane_pitch_degrees", 0.0),
+        "atlas_plane_yaw_degrees": candidate.get("atlas_plane_yaw_degrees", 0.0),
         "score": candidate["score"],
         "base_score": candidate.get("base_score", candidate["score"]),
         "ap_prior_penalty": candidate.get("ap_prior_penalty", 0.0),
@@ -1008,11 +1040,26 @@ def _rank_candidates_for_row(
     ap_prior_weight: float,
 ) -> list[dict[str, Any]]:
     if ordinal == 0 and int(cfg.anchor_search_stride_slices) > 1:
+        stride = int(cfg.anchor_search_stride_slices)
+        refine_radius = (
+            max(0, int(cfg.anchor_refine_radius_slices))
+            if cfg.anchor_refine_radius_slices is not None
+            else max(int(cfg.search_radius_slices), stride)
+        )
+    else:
+        stride = int(cfg.search_stride_slices)
+        refine_radius = (
+            max(0, int(cfg.search_refine_radius_slices))
+            if cfg.search_refine_radius_slices is not None
+            else max(int(cfg.search_radius_slices), stride)
+        )
+
+    if stride > 1:
         coarse_indices = _candidate_indices(
             expected_index,
             radius=search_radius,
             axis_length=axis_length,
-            step=int(cfg.anchor_search_stride_slices),
+            step=stride,
         )
         coarse_indices = _filter_indices_by_ap(
             coarse_indices,
@@ -1041,15 +1088,11 @@ def _rank_candidates_for_row(
             ap_prior_weight=ap_prior_weight,
             coordinate_system=cfg.ap_coordinate_system,
             ap_coordinate_offset_mm=cfg.ap_coordinate_offset_mm,
+            atlas_plane_angles=_atlas_plane_angle_candidates(cfg),
         )
         if not coarse_ranked:
             return []
         coarse_ranked.sort(key=lambda item: item["score"], reverse=True)
-        refine_radius = (
-            max(0, int(cfg.anchor_refine_radius_slices))
-            if cfg.anchor_refine_radius_slices is not None
-            else max(int(cfg.search_radius_slices), int(cfg.anchor_search_stride_slices))
-        )
         refine_center = int(coarse_ranked[0]["atlas_slice_index"])
         refine_indices = _candidate_indices(refine_center, radius=refine_radius, axis_length=axis_length)
         all_indices = sorted({*coarse_indices, *refine_indices})
@@ -1087,6 +1130,7 @@ def _rank_candidates_for_row(
         ap_prior_weight=ap_prior_weight,
         coordinate_system=cfg.ap_coordinate_system,
         ap_coordinate_offset_mm=cfg.ap_coordinate_offset_mm,
+        atlas_plane_angles=_atlas_plane_angle_candidates(cfg),
     )
 
 
@@ -1107,26 +1151,10 @@ def _rank_candidate_indices(
     ap_prior_weight: float,
     coordinate_system: APCoordinateSystem,
     ap_coordinate_offset_mm: float,
+    atlas_plane_angles: list[tuple[float, float]],
 ) -> list[dict[str, Any]]:
     ranked = []
     for atlas_slice_index in candidate_indices:
-        reference_slice = _extract_slice(atlas_reference, slice_axis, atlas_slice_index)
-        annotation_slice = _extract_slice(atlas_annotation, slice_axis, atlas_slice_index)
-        atlas_mask = np.asarray(annotation_slice) > 0
-        warped_section, registration = _register_prepared_section_to_atlas(
-            prepared_section=prepared_section,
-            atlas_reference=reference_slice,
-            atlas_mask=atlas_mask,
-            config=registration_config,
-        )
-        registration.update(_anatomical_alignment_metrics(registration, atlas_mask))
-        overlay = _compose_overlay(
-            warped_section,
-            reference_slice,
-            atlas_mask,
-            registration_config,
-            section_mask=registration.get("_warped_display_mask"),
-        )
         atlas_ap_mm = atlas_index_to_ap_mm(
             atlas_slice_index,
             shape=atlas_reference.shape,
@@ -1143,35 +1171,71 @@ def _rank_candidate_indices(
             orientation=atlas_orientation,
             axis_index=slice_axis,
         )
-        base_score = _candidate_score(
-            registration,
-            boundary_distance_weight=boundary_distance_weight,
-            dorsal_midline_weight=dorsal_midline_weight,
-        )
         ap_prior_penalty = _ap_prior_penalty(
             atlas_ap_mm,
             ap_prior_mm=ap_prior_mm,
             ap_prior_weight=ap_prior_weight,
         )
-        score = base_score - ap_prior_penalty
-        ranked.append(
-            {
-                "atlas_slice_index": atlas_slice_index,
-                "atlas_ap_mm": atlas_ap_mm,
-                "atlas_native_ap_mm": atlas_native_ap_mm,
-                "ap_coordinate_system": coordinate_system,
-                "ap_coordinate_offset_mm": ap_coordinate_offset_mm,
-                "score": score,
-                "base_score": base_score,
-                "ap_prior_penalty": ap_prior_penalty,
-                "registration": registration,
-                "reference_slice": reference_slice,
-                "annotation_slice": annotation_slice,
-                "section_image": section_image,
-                "overlay": overlay,
-                "warped_section": warped_section,
-            }
-        )
+        for pitch_degrees, yaw_degrees in atlas_plane_angles:
+            reference_slice = _extract_atlas_plane(
+                atlas_reference,
+                slice_axis,
+                atlas_slice_index,
+                pitch_degrees=pitch_degrees,
+                yaw_degrees=yaw_degrees,
+                resolution_um=atlas_resolution,
+                order=1,
+            )
+            annotation_slice = _extract_atlas_plane(
+                atlas_annotation,
+                slice_axis,
+                atlas_slice_index,
+                pitch_degrees=pitch_degrees,
+                yaw_degrees=yaw_degrees,
+                resolution_um=atlas_resolution,
+                order=0,
+            )
+            atlas_mask = np.asarray(annotation_slice) > 0
+            warped_section, registration = _register_prepared_section_to_atlas(
+                prepared_section=prepared_section,
+                atlas_reference=reference_slice,
+                atlas_mask=atlas_mask,
+                config=registration_config,
+            )
+            registration.update(_anatomical_alignment_metrics(registration, atlas_mask))
+            overlay = _compose_overlay(
+                warped_section,
+                reference_slice,
+                atlas_mask,
+                registration_config,
+                section_mask=registration.get("_warped_display_mask"),
+            )
+            base_score = _candidate_score(
+                registration,
+                boundary_distance_weight=boundary_distance_weight,
+                dorsal_midline_weight=dorsal_midline_weight,
+            )
+            score = base_score - ap_prior_penalty
+            ranked.append(
+                {
+                    "atlas_slice_index": atlas_slice_index,
+                    "atlas_ap_mm": atlas_ap_mm,
+                    "atlas_native_ap_mm": atlas_native_ap_mm,
+                    "atlas_plane_pitch_degrees": float(pitch_degrees),
+                    "atlas_plane_yaw_degrees": float(yaw_degrees),
+                    "ap_coordinate_system": coordinate_system,
+                    "ap_coordinate_offset_mm": ap_coordinate_offset_mm,
+                    "score": score,
+                    "base_score": base_score,
+                    "ap_prior_penalty": ap_prior_penalty,
+                    "registration": registration,
+                    "reference_slice": reference_slice,
+                    "annotation_slice": annotation_slice,
+                    "section_image": section_image,
+                    "overlay": overlay,
+                    "warped_section": warped_section,
+                }
+            )
     return ranked
 
 
@@ -1254,6 +1318,8 @@ def _write_candidate_grid(candidates: list[dict[str, Any]], overlay_paths: list[
         label = (
             f"{selected_label}rank {rank}{score_rank_label}  index {int(candidate['atlas_slice_index'])}  "
             f"{ap_label} {float(candidate['atlas_ap_mm']):.3f} mm\n"
+            f"pitch {float(candidate.get('atlas_plane_pitch_degrees', 0.0)):+.1f} deg  "
+            f"yaw {float(candidate.get('atlas_plane_yaw_degrees', 0.0)):+.1f} deg  "
             f"score {float(candidate['score']):.3f}  "
             f"dice {float(candidate['registration']['dice']):.3f}  "
             f"iou {float(candidate['registration']['iou']):.3f}"
@@ -1346,19 +1412,34 @@ def _atlas_preview_title(
     atlas_ap_mm: float,
     atlas_native_ap_mm: float,
     ap_coordinate_system: str,
+    atlas_plane_pitch_degrees: float = 0.0,
+    atlas_plane_yaw_degrees: float = 0.0,
 ) -> str:
     ap_label = "Paxinos AP" if ap_coordinate_system == "paxinos" else "AP"
+    angle_label = f"  pitch {atlas_plane_pitch_degrees:+.1f} deg  yaw {atlas_plane_yaw_degrees:+.1f} deg"
     if ap_coordinate_system == "paxinos" and abs(float(atlas_ap_mm) - float(atlas_native_ap_mm)) > 1e-9:
         return (
             f"section {section_index:03d} -> atlas index {atlas_slice_index:04d}  "
-            f"{ap_label} {atlas_ap_mm:+.3f} mm  native AP {atlas_native_ap_mm:+.3f} mm"
+            f"{ap_label} {atlas_ap_mm:+.3f} mm  native AP {atlas_native_ap_mm:+.3f} mm{angle_label}"
         )
-    return f"section {section_index:03d} -> atlas index {atlas_slice_index:04d}  {ap_label} {atlas_ap_mm:+.3f} mm"
+    return (
+        f"section {section_index:03d} -> atlas index {atlas_slice_index:04d}  "
+        f"{ap_label} {atlas_ap_mm:+.3f} mm{angle_label}"
+    )
 
 
 def _ap_label_for_filename(ap_mm: float) -> str:
     prefix = "p" if float(ap_mm) >= 0 else "m"
     return prefix + f"{abs(float(ap_mm)):.3f}".replace(".", "p")
+
+
+def _angle_label_for_filename(pitch_degrees: float, yaw_degrees: float) -> str:
+    return f"pitch{_signed_float_label(pitch_degrees)}_yaw{_signed_float_label(yaw_degrees)}"
+
+
+def _signed_float_label(value: float) -> str:
+    prefix = "p" if float(value) >= 0 else "m"
+    return prefix + f"{abs(float(value)):.2f}".replace(".", "p")
 
 
 def _expected_index_for_row(
@@ -1421,6 +1502,24 @@ def _candidate_indices(expected_index: int, *, radius: int, axis_length: int, st
     start = max(0, expected_index - max(0, int(radius)))
     stop = min(axis_length - 1, expected_index + max(0, int(radius)))
     return list(range(start, stop + 1, max(1, int(step))))
+
+
+def _atlas_plane_angle_candidates(cfg: AtlasIndexSuggestionConfig) -> list[tuple[float, float]]:
+    if not cfg.atlas_plane_angle_search:
+        return [(0.0, 0.0)]
+
+    pitch_values = tuple(float(value) for value in cfg.atlas_plane_pitch_degrees) or (0.0,)
+    yaw_values = tuple(float(value) for value in cfg.atlas_plane_yaw_degrees) or (0.0,)
+    candidates = sorted({(pitch, yaw) for pitch in pitch_values for yaw in yaw_values})
+    return candidates or [(0.0, 0.0)]
+
+
+def _candidate_identity(candidate: dict[str, Any]) -> tuple[int, float, float]:
+    return (
+        int(candidate["atlas_slice_index"]),
+        round(float(candidate.get("atlas_plane_pitch_degrees", 0.0)), 6),
+        round(float(candidate.get("atlas_plane_yaw_degrees", 0.0)), 6),
+    )
 
 
 def _select_candidate(ranked: list[dict[str, Any]], forced_index: int | None) -> dict[str, Any]:
@@ -1502,6 +1601,60 @@ def _axis_index_from_orientation(orientation: str, axis_name: AxisName) -> int:
 
 def _extract_slice(volume: np.ndarray, axis: int, index: int) -> np.ndarray:
     return np.take(volume, index, axis=axis)
+
+
+def _extract_atlas_plane(
+    volume: np.ndarray,
+    axis: int,
+    index: int,
+    *,
+    pitch_degrees: float = 0.0,
+    yaw_degrees: float = 0.0,
+    resolution_um: list[Any] | tuple[Any, ...] | None = None,
+    order: int,
+) -> np.ndarray:
+    if abs(float(pitch_degrees)) < 1e-12 and abs(float(yaw_degrees)) < 1e-12:
+        return _extract_slice(volume, axis, index)
+
+    array = np.asarray(volume)
+    if array.ndim != 3:
+        raise ValueError(f"Oblique atlas plane extraction expects a 3D atlas volume, got shape {array.shape}.")
+
+    axis = int(axis)
+    out_axes = [dimension for dimension in range(array.ndim) if dimension != axis]
+    output_shape = (array.shape[out_axes[0]], array.shape[out_axes[1]])
+    yy, xx = np.meshgrid(
+        np.arange(output_shape[0], dtype=np.float32),
+        np.arange(output_shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    center_y = 0.5 * float(output_shape[0] - 1)
+    center_x = 0.5 * float(output_shape[1] - 1)
+
+    resolution = [1.0, 1.0, 1.0] if resolution_um is None else [float(value) for value in resolution_um]
+    slice_resolution = max(1e-6, float(resolution[axis]))
+    row_resolution = float(resolution[out_axes[0]])
+    col_resolution = float(resolution[out_axes[1]])
+    slice_offsets = (
+        np.tan(np.deg2rad(float(pitch_degrees))) * ((yy - center_y) * row_resolution / slice_resolution)
+        + np.tan(np.deg2rad(float(yaw_degrees))) * ((xx - center_x) * col_resolution / slice_resolution)
+    )
+
+    coordinates: list[np.ndarray] = [np.zeros(output_shape, dtype=np.float32) for _ in range(array.ndim)]
+    coordinates[axis] = float(index) + slice_offsets.astype(np.float32)
+    coordinates[out_axes[0]] = yy
+    coordinates[out_axes[1]] = xx
+    sampled = ndimage.map_coordinates(
+        array.astype(np.float32),
+        coordinates,
+        order=int(order),
+        mode="constant",
+        cval=0.0,
+        prefilter=bool(order > 1),
+    )
+    if order == 0:
+        return sampled.astype(array.dtype, copy=False)
+    return sampled.astype(np.float32, copy=False)
 
 
 def _config_for_json(cfg: AtlasIndexSuggestionConfig) -> dict[str, Any]:

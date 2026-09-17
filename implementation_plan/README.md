@@ -12,3 +12,6 @@
 - [2026-07-17 Landmark And Boundary Atlas Scoring](2026-07-17-landmark-boundary-atlas-scoring.md)
 - [2026-07-17 Constrained Affine Slice Registration](2026-07-17-constrained-affine-registration.md)
 - [2026-07-17 Selected Atlas Preview PNGs](2026-07-17-selected-atlas-preview-pngs.md)
+- [2026-08-24 Oblique Atlas Plane And Nonlinear Refinement](2026-08-24-oblique-atlas-plane-and-nonlinear-refinement.md)
+- [2026-08-28 Large Slide Detection Plane Memory](2026-08-28-large-slide-detection-plane-memory.md)
+- [2026-08-28 Independent Atlas Search Stride](2026-08-28-independent-atlas-search-stride.md)

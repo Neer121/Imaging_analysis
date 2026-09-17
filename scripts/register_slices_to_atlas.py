@@ -111,6 +111,36 @@ def main() -> None:
         default=1.2,
         help="Weight for penalizing outer slice boundary outside the atlas mask.",
     )
+    parser.add_argument(
+        "--nonlinear-refinement-model",
+        choices=("none", "boundary_spline"),
+        default="none",
+        help="Optional local boundary refinement after the global similarity/affine fit.",
+    )
+    parser.add_argument(
+        "--nonlinear-max-displacement-px",
+        type=float,
+        default=8.0,
+        help="Maximum cumulative local displacement in atlas pixels for boundary_spline refinement.",
+    )
+    parser.add_argument(
+        "--nonlinear-control-point-spacing-px",
+        type=float,
+        default=48.0,
+        help="Smoothing scale for the boundary_spline displacement field.",
+    )
+    parser.add_argument(
+        "--nonlinear-iterations",
+        type=int,
+        default=2,
+        help="Number of conservative boundary_spline refinement iterations.",
+    )
+    parser.add_argument(
+        "--nonlinear-boundary-sample-step",
+        type=int,
+        default=3,
+        help="Sample every N boundary pixels when estimating the local displacement field.",
+    )
     args = parser.parse_args()
 
     config = SliceRegistrationConfig(
@@ -136,6 +166,11 @@ def main() -> None:
         boundary_fit_dilation_px=args.boundary_fit_dilation_px,
         boundary_fit_weight=args.boundary_fit_weight,
         boundary_containment_weight=args.boundary_containment_weight,
+        nonlinear_refinement_model=args.nonlinear_refinement_model,
+        nonlinear_max_displacement_px=args.nonlinear_max_displacement_px,
+        nonlinear_control_point_spacing_px=args.nonlinear_control_point_spacing_px,
+        nonlinear_iterations=args.nonlinear_iterations,
+        nonlinear_boundary_sample_step=args.nonlinear_boundary_sample_step,
     )
     result = register_slices_to_atlas(args.pairing_manifest, args.output_dir, config=config)
     print(f"Slice registration output directory: {result.output_dir}")

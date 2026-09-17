@@ -11,6 +11,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from brain_section_pipeline import AtlasIndexSuggestionConfig, SliceRegistrationConfig, suggest_atlas_indices
 
 
+def _parse_float_list(value: str) -> tuple[float, ...]:
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("Provide at least one comma-separated float.")
+    try:
+        return tuple(float(item) for item in values)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid comma-separated float list: {value!r}") from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path, help="Path to section_manifest.csv.")
@@ -52,6 +62,18 @@ def parse_args() -> argparse.Namespace:
         help="Use best_score for independent per-section selection or spacing_locked to anchor later sections to the first selected index.",
     )
     parser.add_argument("--search-radius-slices", type=int, default=25)
+    parser.add_argument(
+        "--search-stride-slices",
+        type=int,
+        default=1,
+        help="Coarse candidate stride for non-anchor searches. Values above 1 enable per-section coarse-to-fine search.",
+    )
+    parser.add_argument(
+        "--search-refine-radius-slices",
+        type=int,
+        default=None,
+        help="Fine search radius around each non-anchor section's best coarse candidate.",
+    )
     parser.add_argument(
         "--anchor-search-radius-slices",
         type=int,
@@ -144,6 +166,23 @@ def parse_args() -> argparse.Namespace:
         default=0.45,
         help="Candidate score penalty weight for dorsal midline notch/anchor mismatch.",
     )
+    parser.add_argument(
+        "--atlas-plane-angle-search",
+        action="store_true",
+        help="Search oblique atlas planes by combining each AP candidate with pitch/yaw angle candidates.",
+    )
+    parser.add_argument(
+        "--atlas-plane-pitch-degrees",
+        type=_parse_float_list,
+        default=(0.0,),
+        help="Comma-separated pitch angles in degrees. Pitch varies AP position along the atlas preview vertical axis.",
+    )
+    parser.add_argument(
+        "--atlas-plane-yaw-degrees",
+        type=_parse_float_list,
+        default=(0.0,),
+        help="Comma-separated yaw angles in degrees. Yaw varies AP position along the atlas preview horizontal axis.",
+    )
     return parser.parse_args()
 
 
@@ -185,6 +224,8 @@ def main() -> None:
         direction=args.direction,
         selection_strategy=args.selection_strategy,
         search_radius_slices=args.search_radius_slices,
+        search_stride_slices=args.search_stride_slices,
+        search_refine_radius_slices=args.search_refine_radius_slices,
         anchor_search_radius_slices=args.anchor_search_radius_slices,
         anchor_search_stride_slices=args.anchor_search_stride_slices,
         anchor_refine_radius_slices=args.anchor_refine_radius_slices,
@@ -201,6 +242,9 @@ def main() -> None:
         top_n=args.top_n,
         boundary_distance_weight=args.boundary_distance_weight,
         dorsal_midline_weight=args.dorsal_midline_weight,
+        atlas_plane_angle_search=args.atlas_plane_angle_search,
+        atlas_plane_pitch_degrees=args.atlas_plane_pitch_degrees,
+        atlas_plane_yaw_degrees=args.atlas_plane_yaw_degrees,
         registration_config=registration_config,
     )
     result = suggest_atlas_indices(args.manifest, args.output_dir, config=config)
